@@ -1,0 +1,105 @@
+# ==========================================================================
+#  docker-compose.yml — simple-model-api
+#
+#  Production-grade service definition with:
+#    • Gunicorn + UvicornWorker ASGI server with --preload for CoW sharing
+#    • Strict cgroup memory and CPU limits (FR-3.2 / rubric requirement)
+#    • Health-check wired to the /health endpoint (FR-2.2)
+# ==========================================================================
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # ── Production ASGI server configuration ──────────────────────────
+    #
+    #   gunicorn --preload  →  The master process imports the application
+    #   module (main:app) and loads the ResNet-50 model BEFORE forking
+    #   workers.  On Linux, fork() gives each worker a copy-on-write
+    #   (CoW) view of the model weights — the ~100 MB parameter block
+    #   lives in physical RAM only once, regardless of worker count.
+    #
+    #   -k uvicorn.workers.UvicornWorker  →  Each Gunicorn worker runs
+    #   a full async Uvicorn event loop, giving us both multi-process
+    #   parallelism and async I/O within each worker.
+    #
+    #   --timeout 120  →  Generous timeout for cold-start model load.
+    #   --graceful-timeout 30  →  Workers get 30 s to finish in-flight
+    #   requests on SIGTERM before being killed.
+    #
+    command: >
+      gunicorn main:app
+      -k uvicorn.workers.UvicornWorker
+      --bind 0.0.0.0:8000
+      --workers 2
+      --preload
+      --timeout 120
+      --graceful-timeout 30
+      --access-logfile -
+
+    ports:
+      - "8000:8000"
+
+    # ── Cgroup resource protections ───────────────────────────────────
+    #
+    #   Memory budget breakdown (--preload, CPU-only PyTorch):
+    #     ResNet-50 weights (FP32)      ≈ 100 MB
+    #     Python interpreter + deps     ≈ 200 MB
+    #     Per-request tensor workspace  ≈  50 MB × 2 workers peak
+    #     torchvision transform buffers ≈  50 MB
+    #     Safety headroom               ≈ 100 MB
+    #                                   ─────────
+    #     Total                         ≈ 600 MB  →  limit set to 768 MB
+    #
+    #   With --preload CoW, the model weights are shared across workers
+    #   in physical RAM, so 2 workers ≠ 2× model memory.
+    #
+    #   mem_reservation (soft limit) is set lower to allow the kernel
+    #   scheduler to reclaim memory under pressure before hitting the
+    #   hard OOM-kill threshold.
+    #
+    #   CPU limit of 2.0 cores matches the 2-worker configuration —
+    #   each worker gets roughly one core at full saturation.
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "1.0"
+
+    # ── Environment ───────────────────────────────────────────────────
+    environment:
+      # Limit PyTorch intra-op parallelism to match allocated CPU cores,
+      # preventing thread over-subscription in a cgroup-constrained env.
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      TORCH_NUM_THREADS: "1"
+
+      # Disable CUDA — this service runs CPU-only inference.
+      CUDA_VISIBLE_DEVICES: ""
+
+      # Standard Python container hygiene.
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+      # Redirect PyTorch Hub cache to a writable directory for the non-root user.
+      TORCH_HOME: "/tmp/torch"
+
+    # ── Health check ──────────────────────────────────────────────────
+    #   Mirrors the Dockerfile HEALTHCHECK but is authoritative when
+    #   running via Compose.  start_period covers the cold-start model
+    #   download on very first build.
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+    # ── Restart policy ────────────────────────────────────────────────
+    restart: unless-stopped

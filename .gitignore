@@ -1,0 +1,46 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables
+.env.local
+.env.*
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# PyTorch
+.torch/
+*.pt
+*.pth
+
+# IDEs / Editor configurations
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing / Type checking
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Logs
+logs/
+*.log
+
+# Mac OS
+.DS_Store
