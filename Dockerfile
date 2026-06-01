@@ -1,15 +1,18 @@
 # ==========================================================================
-#  Multi-stage Dockerfile — simple-model-api
+#  Multi-stage Dockerfile — simple-model-api  (v2.0.0 — baked weights)
 #
 #  Stage 1 (builder):  Install all Python dependencies into a virtual-env
 #                      so we can copy only the finished artefact forward.
-#  Stage 2 (runtime):  Lean python:3.10-slim image with just the venv and
-#                      application code.  Runs as non-root.
+#  Stage 2 (runtime):  Lean python:3.10-slim image with just the venv,
+#                      pre-downloaded ResNet-50 weights, and app code.
+#                      Runs as non-root.  Fully offline-ready.
 #
-#  Layer-caching strategy:
-#      requirements.txt is COPY'd and pip-installed BEFORE any application
-#      source code.  A change to main.py / inference.py only invalidates
-#      the final COPY layer — PyTorch and friends are never re-downloaded.
+#  Layer-caching strategy (top → bottom = most stable → most volatile):
+#      1. OS base + venv copy            (changes only on dependency bump)
+#      2. ResNet-50 weight download      (changes only on model version bump)
+#      3. Application source code        (changes on every code commit)
+#
+#  This ordering ensures a code change never re-downloads the ~100 MB model.
 # ==========================================================================
 
 # ── Stage 1: Builder ─────────────────────────────────────────────────────
@@ -55,6 +58,22 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Create a non-root user to run the application.
 RUN groupadd --gid 1000 appuser && \
     useradd  --uid 1000 --gid appuser --no-create-home appuser
+
+# ── Layer 2: Bake ResNet-50 weights into the image ───────────────────────
+# Pre-download at BUILD time so the container never hits the network at
+# runtime.  This layer sits between the venv and application code so that:
+#   • A code change does NOT invalidate the ~100 MB weights layer.
+#   • A requirements.txt change DOES rebuild everything below it (correct).
+#
+# TORCH_HOME is set for both build and runtime so torchvision.models finds
+# the cached weights at /opt/torch_cache/hub/checkpoints/.
+ENV TORCH_HOME=/opt/torch_cache
+
+RUN python -c "\
+import torchvision; \
+from torchvision.models import ResNet50_Weights; \
+torchvision.models.resnet50(weights=ResNet50_Weights.DEFAULT)" && \
+    chown -R appuser:appuser /opt/torch_cache
 
 WORKDIR /app
 

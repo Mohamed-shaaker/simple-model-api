@@ -1,0 +1,26 @@
+###############################################################################
+# simple-model-api — Kubernetes Service
+# ──────────────────────────────────────
+# Exposes the ML Image Recognition API outside the cluster via a NodePort,
+# making it reachable through `minikube service` or the Minikube IP.
+#
+# Quick-ref configurable values (search & replace):
+#   TARGET_PORT  →  8000   (must match containerPort in deployment.yaml)
+#   NODE_PORT    →  30080  (valid range: 30000-32767)
+###############################################################################
+apiVersion: v1
+kind: Service
+metadata:
+  name: simple-model-api-service
+  labels:
+    app: simple-model-api
+spec:
+  type: NodePort
+  selector:
+    app: simple-model-api          # must match pod labels in the Deployment
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8000                   # cluster-internal virtual port
+      targetPort: 8000             # container port (matches EXPOSE 8000)
+      nodePort: 30080              # fixed node port for predictable local access

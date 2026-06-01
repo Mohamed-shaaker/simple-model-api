@@ -1,0 +1,102 @@
+###############################################################################
+# simple-model-api — Kubernetes Deployment
+# ─────────────────────────────────────────
+# Runs the ML Image Recognition API inside Minikube.
+#
+# Key design decisions
+#   • imagePullPolicy: IfNotPresent  → uses the image already in Minikube's
+#     local Docker daemon (built with `eval $(minikube docker-env)`).
+#   • 2 replicas give basic HA / rolling-update capability on a single node.
+#   • Resource requests/limits are tuned for a local ML workload while keeping
+#     the Minikube VM stable.
+#
+# Quick-ref configurable values (search & replace):
+#   CONTAINER_PORT  →  8000
+#   IMAGE_TAG       →  simple-model-api:v2.0.0
+#   REPLICAS        →  2
+###############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simple-model-api-deployment
+  labels:
+    app: simple-model-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: simple-model-api
+  # ── Rolling-update strategy ────────────────────────────────────────────────
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1            # allow 1 extra pod during deploys
+      maxUnavailable: 0      # keep all existing pods until new ones are ready
+  template:
+    metadata:
+      labels:
+        app: simple-model-api
+    spec:
+      containers:
+        - name: simple-model-api
+          image: simple-model-api:v2.0.0
+          # ── CRITICAL for Minikube local images ─────────────────────────────
+          # Never pull from a remote registry; use the image that was built
+          # directly inside Minikube's Docker daemon.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          # ── Resource Budgets ───────────────────────────────────────────────
+          # Requests  = what the scheduler guarantees (used for bin-packing).
+          # Limits    = hard ceiling the kubelet enforces (OOM-kill / throttle).
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          # ── Health Probes ──────────────────────────────────────────────────
+          # Three-probe strategy — now with baked-in weights (v2.0.0):
+          #
+          #  1. startupProbe   — tightened to 20 × 10s = ~3 min. No network
+          #                      download needed; just Gunicorn + model init.
+          #  2. readinessProbe — gates traffic once startup passes.
+          #  3. livenessProbe  — restarts hung pods after startup passes.
+          #
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5    # weights baked in — fast cold start
+            periodSeconds: 10         # poll every 10 seconds
+            timeoutSeconds: 5
+            failureThreshold: 20      # 20 × 10s = 200s (~3 min) max startup
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 0    # startupProbe already handled the initial wait
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 0    # startupProbe already handled the initial wait
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # ── Environment Variables ──────────────────────────────────────────
+          # Add any runtime config your FastAPI app needs here.
+          env:
+            - name: PORT
+              value: "8000"
+            # Points to the pre-downloaded weights baked into the image.
+            # Must match the TORCH_HOME set in the Dockerfile.
+            - name: TORCH_HOME
+              value: "/opt/torch_cache"
+      # ── Graceful Shutdown ──────────────────────────────────────────────────
+      terminationGracePeriodSeconds: 30
