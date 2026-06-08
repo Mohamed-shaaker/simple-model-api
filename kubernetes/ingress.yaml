@@ -1,0 +1,94 @@
+###############################################################################
+# simple-model-api — Kubernetes Ingress  (FR-2)
+# ──────────────────────────────────────────────
+# L7 reverse-proxy gateway that routes external HTTP traffic into the cluster
+# via the NGINX Ingress Controller.
+#
+# Traffic flow:
+#
+#   Client (browser / curl)
+#       │
+#       │  http://model-api.local/predict
+#       │  http://model-api.local/health
+#       ▼
+#   ┌──────────────────────────────────┐
+#   │  NGINX Ingress Controller (pod)  │  ← reads this manifest's rules
+#   │  Listens on node ports 80 / 443  │
+#   └──────────────┬───────────────────┘
+#                  │  proxy_pass (path preserved)
+#                  ▼
+#   ┌──────────────────────────────────┐
+#   │  simple-model-api-service:80     │  ← ClusterIP Service
+#   └──────────────┬───────────────────┘
+#                  │  kube-proxy DNAT → :8000
+#                  ▼
+#   ┌──────────────────────────────────┐
+#   │  Pod replicas (port 8000)        │  ← FastAPI / Gunicorn
+#   └──────────────────────────────────┘
+#
+# Path routing design
+# ───────────────────
+#   Only /predict and /health are exposed externally.  Internal-only
+#   endpoints (/info, /docs, /openapi.json) are NOT routed, reducing
+#   the attack surface.  pathType: Prefix means /predict also matches
+#   /predict?top_k=3 (query strings are not part of path matching).
+#
+# Prerequisites:
+#   minikube addons enable ingress      ← installs the NGINX controller
+#   Add "$(minikube ip) model-api.local" to /etc/hosts (or C:\Windows\
+#   System32\drivers\etc\hosts on Windows).
+#
+# Quick-ref configurable values (search & replace):
+#   HOST            →  model-api.local
+#   BACKEND_SERVICE →  simple-model-api-service
+#   BACKEND_PORT    →  80
+###############################################################################
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: simple-model-api-ingress
+  labels:
+    app: simple-model-api
+  annotations:
+    # ── NGINX-specific tuning ────────────────────────────────────────────────
+    # No rewrite-target: the FastAPI app serves /predict and /health natively,
+    # so the original request path must be forwarded unchanged.
+
+    # Increase proxy timeouts for ML inference endpoints that may take longer
+    # than the default 60s (e.g., large image classification requests).
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+
+    # Raise the max request body size for image uploads (default 1m).
+    # Matches the application's 10 MB limit (FR-2.4) with headroom.
+    nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+
+spec:
+  # ── Ingress Class ──────────────────────────────────────────────────────────
+  # Explicitly select the NGINX ingress controller.  Required in clusters
+  # with multiple controllers (e.g., nginx + traefik).
+  ingressClassName: nginx
+
+  rules:
+    # ── Host-based routing ───────────────────────────────────────────────────
+    # All requests to model-api.local are handled by these rules.
+    - host: model-api.local
+      http:
+        paths:
+          # ── Inference endpoint ─────────────────────────────────────────────
+          - path: /predict
+            pathType: Prefix
+            backend:
+              service:
+                name: simple-model-api-service
+                port:
+                  number: 80
+
+          # ── Health / readiness probe endpoint ──────────────────────────────
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: simple-model-api-service
+                port:
+                  number: 80

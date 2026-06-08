@@ -1,0 +1,112 @@
+###############################################################################
+# simple-model-api — Horizontal Pod Autoscaler  (FR-3)
+# ─────────────────────────────────────────────────────
+# ML-optimised autoscaler for a ResNet-50 FastAPI service running in Minikube.
+# Scales the Deployment between 3 and 5 replicas based on both CPU and Memory
+# utilisation reported by the Metrics Server.
+#
+# Why minReplicas = 3?
+# ────────────────────
+#   ResNet-50 model loading takes several seconds (cold start).  Keeping 3
+#   pods warm at all times means at least 2 hot standbys are always ready
+#   to absorb traffic while the third may be mid-inference.  This eliminates
+#   user-facing latency spikes from cold PyTorch model loads.
+#
+# How the scaling math works (CPU)
+# ────────────────────────────────
+#   CPU request per pod     = 500m  (from deployment.yaml)
+#   Target average util     = 70%   → target usage = 350m per pod
+#
+#   Example:  3 pods at 450m each → avg util = 90%
+#             Desired = ceil(3 × 90/70) = ceil(3.86) = 4
+#
+# How the scaling math works (Memory)
+# ────────────────────────────────────
+#   Memory request per pod  = 1Gi   (from deployment.yaml)
+#   Target average util     = 80%   → target usage = ~820Mi per pod
+#
+#   ResNet-50 idles at ~680Mi.  Under batch inference the resident set
+#   grows toward 1Gi.  At 80% the HPA adds pods before we approach the
+#   2Gi limit, preventing OOM-kills during sustained load.
+#
+#   The HPA uses the MAX of desired replicas across all metrics, so a
+#   memory spike alone (e.g. large batch of images) triggers scale-up
+#   even if CPU is idle.
+#
+# Prerequisites
+#   • Metrics Server must be running:  minikube addons enable metrics-server
+#   • The Deployment must have cpu AND memory resource requests defined.
+#
+# Quick-ref configurable values (search & replace):
+#   MIN_REPLICAS              →  3
+#   MAX_REPLICAS              →  5
+#   CPU_TARGET_UTILIZATION    →  70
+#   MEMORY_TARGET_UTILIZATION →  80
+###############################################################################
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: simple-model-api-hpa
+  labels:
+    app: simple-model-api
+spec:
+  # ── Target ──────────────────────────────────────────────────────────────────
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: simple-model-api-deployment
+
+  # ── Replica Bounds ──────────────────────────────────────────────────────────
+  # min 3: always keep hot standbys to avoid cold-start model loads.
+  # max 5: fits comfortably in an 8GB Minikube cluster
+  #        (5 pods × 1Gi request = 5Gi, leaving headroom for system pods).
+  minReplicas: 3
+  maxReplicas: 5
+
+  # ── Scaling Metrics ─────────────────────────────────────────────────────────
+  # The HPA evaluates ALL metrics and picks the highest desired replica count.
+  metrics:
+    # --- CPU ---
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          # averageUtilization is a percentage of the cpu *request* (500m).
+          # At 70%, the controller targets ~350m average per pod before
+          # adding capacity — leaves 30% headroom for inference bursts.
+          type: Utilization
+          averageUtilization: 70
+
+    # --- Memory ---
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          # averageUtilization is a percentage of the memory *request* (1Gi).
+          # At 80%, the controller targets ~820Mi average per pod.
+          # ResNet-50 idles at ~680Mi; under batch load it climbs toward 1Gi.
+          # This triggers scale-up before pods risk OOM-kill at the 2Gi limit.
+          type: Utilization
+          averageUtilization: 80
+
+  # ── Scaling Behaviour ───────────────────────────────────────────────────────
+  # Scale-up:  react immediately to load spikes.  Allow up to 2 new pods
+  #            per 60s window — with 5 max replicas and 3 min, we reach
+  #            full capacity in a single scale-up cycle.
+  # Scale-down: very conservative — wait 300s (5 min) of sustained low
+  #             utilisation, then remove only 1 pod per 180s window.
+  #             This guards against premature scale-in between inference
+  #             batches and protects the warm model cache in each pod.
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0             # react immediately to load
+      policies:
+        - type: Pods
+          value: 2                              # add at most 2 pods per window
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300           # 5-min cooldown before scaling in
+      policies:
+        - type: Pods
+          value: 1                              # remove at most 1 pod per window
+          periodSeconds: 180                    # 3-min between successive removals

@@ -92,7 +92,7 @@ EXPOSE 8000
 
 # Default entrypoint — overridden by docker-compose command.
 CMD ["gunicorn", "main:app", \
-     "-k", "uvicorn.workers.UvicornWorker", \
+     "--workers", "1", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--bind", "0.0.0.0:8000", \
-     "--workers", "2", \
-     "--preload"]
+     "--timeout", "120"]

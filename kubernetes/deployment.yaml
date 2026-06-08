@@ -1,19 +1,38 @@
 ###############################################################################
-# simple-model-api — Kubernetes Deployment
-# ─────────────────────────────────────────
-# Runs the ML Image Recognition API inside Minikube.
+# simple-model-api — Kubernetes Deployment  (FR-1 / FR-3)
+# ─────────────────────────────────────────────────────────
+# Production-grade manifest for the ResNet-50 image classification service.
 #
 # Key design decisions
-#   • imagePullPolicy: IfNotPresent  → uses the image already in Minikube's
-#     local Docker daemon (built with `eval $(minikube docker-env)`).
-#   • 2 replicas give basic HA / rolling-update capability on a single node.
-#   • Resource requests/limits are tuned for a local ML workload while keeping
-#     the Minikube VM stable.
+#   • replicas: 3         → matches HPA minReplicas for immediate HA.
+#   • RollingUpdate       → maxSurge=1, maxUnavailable=0 for zero-downtime.
+#   • Resource budget     → requests 500m/1Gi, limits 1000m/2Gi.
+#                           ResNet-50 + PyTorch CPU baseline is ~680Mi idle;
+#                           1Gi request gives safe headroom, 2Gi limit
+#                           accommodates concurrent inference batch spikes.
+#   • imagePullPolicy     → IfNotPresent (local Minikube-built image).
+#
+# Health probe timing rationale
+# ─────────────────────────────
+#   The ResNet-50 lifespan handler performs:
+#     1. Weight deserialization from baked TORCH_HOME (~2-5s, no network).
+#     2. model.eval() mode switch.
+#     3. Warm-up forward pass (torch.randn → model → dispatch tables).
+#     4. ImageNet label list eager-load.
+#   Total cold-start budget: ~10-15s on local clusters, up to ~30s under
+#   node resource contention.
+#
+#   startupProbe  — gates ALL other probes.  30 × 10s = 300s max runway
+#                   absorbs worst-case slow nodes without false-killing.
+#   readinessProbe — 30s initialDelay lets the lifespan finish before
+#                    kube-proxy adds the pod to Service endpoints.
+#   livenessProbe  — 45s initialDelay (> readiness) so a healthy pod is
+#                    never restarted during its first readiness window.
 #
 # Quick-ref configurable values (search & replace):
 #   CONTAINER_PORT  →  8000
 #   IMAGE_TAG       →  simple-model-api:v2.0.0
-#   REPLICAS        →  2
+#   REPLICAS        →  3
 ###############################################################################
 apiVersion: apps/v1
 kind: Deployment
@@ -22,16 +41,18 @@ metadata:
   labels:
     app: simple-model-api
 spec:
-  replicas: 2
+  replicas: 3
   selector:
     matchLabels:
       app: simple-model-api
-  # ── Rolling-update strategy ────────────────────────────────────────────────
+
+  # ── Rolling-update strategy (zero-downtime deploys) ───────────────────────
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 1            # allow 1 extra pod during deploys
-      maxUnavailable: 0      # keep all existing pods until new ones are ready
+      maxSurge: 1            # spin up 1 extra pod before removing old ones
+      maxUnavailable: 0      # never take an existing pod offline until replacement is Ready
+
   template:
     metadata:
       labels:
@@ -40,57 +61,80 @@ spec:
       containers:
         - name: simple-model-api
           image: simple-model-api:v2.0.0
-          # ── CRITICAL for Minikube local images ─────────────────────────────
+
+          # ── CRITICAL for Minikube local images ──────────────────────────────
           # Never pull from a remote registry; use the image that was built
           # directly inside Minikube's Docker daemon.
           imagePullPolicy: IfNotPresent
+
           ports:
             - containerPort: 8000
               protocol: TCP
-          # ── Resource Budgets ───────────────────────────────────────────────
-          # Requests  = what the scheduler guarantees (used for bin-packing).
+
+          # ── Resource Budgets ────────────────────────────────────────────────
+          # Requests  = guaranteed baseline the scheduler reserves on the node.
+          #             500m CPU gives the HPA a meaningful denominator:
+          #             70% target ≈ 350m average usage per pod before scale-up.
+          #             1Gi memory covers ResNet-50 idle (~680Mi) + inference.
           # Limits    = hard ceiling the kubelet enforces (OOM-kill / throttle).
+          #             2Gi memory prevents runaway leakage during batch stress.
           resources:
             requests:
-              memory: "512Mi"
               cpu: "500m"
+              memory: "1Gi"
             limits:
-              memory: "2Gi"
               cpu: "1000m"
-          # ── Health Probes ──────────────────────────────────────────────────
-          # Three-probe strategy — now with baked-in weights (v2.0.0):
+              memory: "2Gi"
+
+          # ── Health & Self-Healing Probes ─────────────────────────────────────
           #
-          #  1. startupProbe   — tightened to 20 × 10s = ~3 min. No network
-          #                      download needed; just Gunicorn + model init.
-          #  2. readinessProbe — gates traffic once startup passes.
-          #  3. livenessProbe  — restarts hung pods after startup passes.
+          # Three-probe strategy for robust lifecycle management:
+          #
+          #  1. startupProbe   — gates initial boot (model weight deserialization
+          #                      + warm-up forward pass).  Prevents liveness from
+          #                      killing a slow-starting pod.
+          #                      30 × 10s = 300s (~5 min) max before K8s gives up.
+          #
+          #  2. readinessProbe — blocks Service traffic until /health returns 200.
+          #                      30s initial delay covers the typical 10-15s model
+          #                      load plus warm-up, with safety margin for node
+          #                      resource contention.
+          #
+          #  3. livenessProbe  — auto-restarts if the Python process freezes or
+          #                      deadlocks.  45s initial delay is deliberately
+          #                      higher than readiness to avoid false restarts
+          #                      during the startup window.
           #
           startupProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 5    # weights baked in — fast cold start
-            periodSeconds: 10         # poll every 10 seconds
+            initialDelaySeconds: 5      # weights baked in — fast cold start
+            periodSeconds: 10           # poll every 10s during boot
             timeoutSeconds: 5
-            failureThreshold: 20      # 20 × 10s = 200s (~3 min) max startup
+            failureThreshold: 30        # 30 × 10s = 300s max startup budget
+
           readinessProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 0    # startupProbe already handled the initial wait
-            periodSeconds: 10
+            initialDelaySeconds: 30     # wait for ResNet-50 lifespan to complete
+            periodSeconds: 5            # check frequently — fast traffic gating
             timeoutSeconds: 5
+            successThreshold: 1
             failureThreshold: 3
+
           livenessProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 0    # startupProbe already handled the initial wait
-            periodSeconds: 20
+            initialDelaySeconds: 45     # > readiness delay; avoids false kill
+            periodSeconds: 15           # auto-restart frozen Python within ~45s
             timeoutSeconds: 5
+            successThreshold: 1
             failureThreshold: 3
-          # ── Environment Variables ──────────────────────────────────────────
-          # Add any runtime config your FastAPI app needs here.
+
+          # ── Environment Variables ───────────────────────────────────────────
           env:
             - name: PORT
               value: "8000"
@@ -98,5 +142,8 @@ spec:
             # Must match the TORCH_HOME set in the Dockerfile.
             - name: TORCH_HOME
               value: "/opt/torch_cache"
-      # ── Graceful Shutdown ──────────────────────────────────────────────────
+
+      # ── Graceful Shutdown ─────────────────────────────────────────────────
+      # 30s matches Gunicorn's default graceful timeout, giving in-flight
+      # inference requests time to complete before SIGKILL.
       terminationGracePeriodSeconds: 30

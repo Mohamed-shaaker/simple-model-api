@@ -1,12 +1,34 @@
 ###############################################################################
-# simple-model-api — Kubernetes Service
-# ──────────────────────────────────────
-# Exposes the ML Image Recognition API outside the cluster via a NodePort,
-# making it reachable through `minikube service` or the Minikube IP.
+# simple-model-api — Kubernetes Service  (FR-2)
+# ──────────────────────────────────────────────
+# Internal ClusterIP service that load-balances traffic across all healthy
+# pods in the simple-model-api Deployment.
+#
+# How ClusterIP load balancing works
+# ──────────────────────────────────
+#   1. The Service is assigned a stable virtual IP (ClusterIP) inside the
+#      cluster's service CIDR.  This IP never changes for the lifetime of
+#      the Service object.
+#
+#   2. kube-proxy (running on every node) programs iptables / IPVS rules
+#      that intercept packets destined for the ClusterIP and DNAT them to
+#      one of the pod endpoints that pass their readinessProbe.
+#
+#   3. By default, iptables mode uses stateless random selection (roughly
+#      round-robin).  IPVS mode supports weighted round-robin, least
+#      connections, and other algorithms.
+#
+#   4. Because the Ingress controller lives *inside* the cluster, it
+#      reaches this Service via the ClusterIP — no NodePort or
+#      LoadBalancer type is required.
+#
+# Traffic flow:
+#
+#   Ingress Controller  ──►  ClusterIP :80  ──►  Pod :8000  (kube-proxy DNAT)
 #
 # Quick-ref configurable values (search & replace):
-#   TARGET_PORT  →  8000   (must match containerPort in deployment.yaml)
-#   NODE_PORT    →  30080  (valid range: 30000-32767)
+#   SERVICE_PORT  →  80     (the port clients / Ingress connect to)
+#   TARGET_PORT   →  8000   (must match containerPort in deployment.yaml)
 ###############################################################################
 apiVersion: v1
 kind: Service
@@ -15,12 +37,19 @@ metadata:
   labels:
     app: simple-model-api
 spec:
-  type: NodePort
+  # ── Service Type ────────────────────────────────────────────────────────────
+  # ClusterIP: internal-only virtual IP.  The Ingress controller handles
+  # external exposure, so no node-level port binding is needed.
+  type: ClusterIP
+
+  # ── Pod Selector ────────────────────────────────────────────────────────────
+  # Must match the pod template labels in deployment.yaml.
   selector:
-    app: simple-model-api          # must match pod labels in the Deployment
+    app: simple-model-api
+
+  # ── Port Mapping ────────────────────────────────────────────────────────────
   ports:
     - name: http
       protocol: TCP
-      port: 8000                   # cluster-internal virtual port
-      targetPort: 8000             # container port (matches EXPOSE 8000)
-      nodePort: 30080              # fixed node port for predictable local access
+      port: 80               # Ingress and in-cluster clients connect here
+      targetPort: 8000        # forwarded to the container's Gunicorn listener
