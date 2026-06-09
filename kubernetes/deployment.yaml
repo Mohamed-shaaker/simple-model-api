@@ -6,11 +6,14 @@
 # Key design decisions
 #   • replicas: 3         → matches HPA minReplicas for immediate HA.
 #   • RollingUpdate       → maxSurge=1, maxUnavailable=0 for zero-downtime.
-#   • Resource budget     → requests 500m/1Gi, limits 1000m/2Gi.
-#                           ResNet-50 + PyTorch CPU baseline is ~680Mi idle;
-#                           1Gi request gives safe headroom, 2Gi limit
-#                           accommodates concurrent inference batch spikes.
+#   • Resource budget     → requests 250m/512Mi, limits 1000m/1.5Gi.
+#                           Conservative requests let the HPA pack more pods
+#                           onto a resource-constrained Minikube node while
+#                           the generous limits (4× CPU, 3× memory) give
+#                           each pod room to burst during inference spikes.
 #   • imagePullPolicy     → IfNotPresent (local Minikube-built image).
+#   • envFrom ConfigMap   → decouples LOG_LEVEL, ENVIRONMENT, etc. from
+#                           this manifest.  Change config without redeploying.
 #
 # Health probe timing rationale
 # ─────────────────────────────
@@ -31,7 +34,7 @@
 #
 # Quick-ref configurable values (search & replace):
 #   CONTAINER_PORT  →  8000
-#   IMAGE_TAG       →  simple-model-api:v2.0.0
+#   IMAGE_TAG       →  simple-model-api:latest
 #   REPLICAS        →  3
 ###############################################################################
 apiVersion: apps/v1
@@ -60,7 +63,7 @@ spec:
     spec:
       containers:
         - name: simple-model-api
-          image: simple-model-api:v2.0.0
+          image: simple-model-api:latest
 
           # ── CRITICAL for Minikube local images ──────────────────────────────
           # Never pull from a remote registry; use the image that was built
@@ -73,18 +76,23 @@ spec:
 
           # ── Resource Budgets ────────────────────────────────────────────────
           # Requests  = guaranteed baseline the scheduler reserves on the node.
-          #             500m CPU gives the HPA a meaningful denominator:
-          #             70% target ≈ 350m average usage per pod before scale-up.
-          #             1Gi memory covers ResNet-50 idle (~680Mi) + inference.
+          #             250m CPU is conservative — with single-worker Gunicorn,
+          #             CPU usage per pod is modest at idle.  The HPA uses
+          #             this as denominator: 70% target ≈ 175m avg before
+          #             scale-up, which is responsive to real inference load.
+          #             512Mi memory covers ResNet-50 idle (~350-400Mi for a
+          #             single worker) with safe headroom.
           # Limits    = hard ceiling the kubelet enforces (OOM-kill / throttle).
-          #             2Gi memory prevents runaway leakage during batch stress.
+          #             1000m CPU prevents any single pod from starving others.
+          #             1.5Gi memory prevents OOM during matrix operations
+          #             while being conservative for local machine hosting.
           resources:
             requests:
-              cpu: "500m"
-              memory: "1Gi"
+              cpu: "250m"
+              memory: "512Mi"
             limits:
               cpu: "1000m"
-              memory: "2Gi"
+              memory: "1536Mi"
 
           # ── Health & Self-Healing Probes ─────────────────────────────────────
           #
@@ -135,6 +143,14 @@ spec:
             failureThreshold: 3
 
           # ── Environment Variables ───────────────────────────────────────────
+          # envFrom injects ALL keys from the ConfigMap as env vars.
+          # Explicit env entries below take PRECEDENCE over ConfigMap values,
+          # so critical runtime paths (PORT, TORCH_HOME) can never be
+          # accidentally overridden by a ConfigMap change.
+          envFrom:
+            - configMapRef:
+                name: simple-model-api-config
+
           env:
             - name: PORT
               value: "8000"

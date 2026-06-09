@@ -2,7 +2,7 @@
 # simple-model-api — Horizontal Pod Autoscaler  (FR-3)
 # ─────────────────────────────────────────────────────
 # ML-optimised autoscaler for a ResNet-50 FastAPI service running in Minikube.
-# Scales the Deployment between 3 and 5 replicas based on both CPU and Memory
+# Scales the Deployment between 3 and 10 replicas based on both CPU and Memory
 # utilisation reported by the Metrics Server.
 #
 # Why minReplicas = 3?
@@ -14,20 +14,21 @@
 #
 # How the scaling math works (CPU)
 # ────────────────────────────────
-#   CPU request per pod     = 500m  (from deployment.yaml)
-#   Target average util     = 70%   → target usage = 350m per pod
+#   CPU request per pod     = 250m  (from deployment.yaml)
+#   Target average util     = 70%   → target usage = 175m per pod
 #
-#   Example:  3 pods at 450m each → avg util = 90%
+#   Example:  3 pods at 225m each → avg util = 90%
 #             Desired = ceil(3 × 90/70) = ceil(3.86) = 4
 #
 # How the scaling math works (Memory)
 # ────────────────────────────────────
-#   Memory request per pod  = 1Gi   (from deployment.yaml)
-#   Target average util     = 80%   → target usage = ~820Mi per pod
+#   Memory request per pod  = 512Mi (from deployment.yaml)
+#   Target average util     = 80%   → target usage = ~410Mi per pod
 #
-#   ResNet-50 idles at ~680Mi.  Under batch inference the resident set
-#   grows toward 1Gi.  At 80% the HPA adds pods before we approach the
-#   2Gi limit, preventing OOM-kills during sustained load.
+#   With single-worker Gunicorn, ResNet-50 idles at ~350-400Mi.
+#   Under batch inference the resident set grows toward 512Mi.
+#   At 80% the HPA adds pods before we approach the 1.5Gi limit,
+#   preventing OOM-kills during sustained load.
 #
 #   The HPA uses the MAX of desired replicas across all metrics, so a
 #   memory spike alone (e.g. large batch of images) triggers scale-up
@@ -39,7 +40,7 @@
 #
 # Quick-ref configurable values (search & replace):
 #   MIN_REPLICAS              →  3
-#   MAX_REPLICAS              →  5
+#   MAX_REPLICAS              →  10
 #   CPU_TARGET_UTILIZATION    →  70
 #   MEMORY_TARGET_UTILIZATION →  80
 ###############################################################################
@@ -57,11 +58,12 @@ spec:
     name: simple-model-api-deployment
 
   # ── Replica Bounds ──────────────────────────────────────────────────────────
-  # min 3: always keep hot standbys to avoid cold-start model loads.
-  # max 5: fits comfortably in an 8GB Minikube cluster
-  #        (5 pods × 1Gi request = 5Gi, leaving headroom for system pods).
+  # min 3:  always keep hot standbys to avoid cold-start model loads.
+  # max 10: with conservative 250m/512Mi requests, 10 pods require
+  #         2500m CPU / 5Gi memory — fits comfortably on a Minikube node
+  #         with 4+ cores and 8GB+ RAM, leaving headroom for system pods.
   minReplicas: 3
-  maxReplicas: 5
+  maxReplicas: 10
 
   # ── Scaling Metrics ─────────────────────────────────────────────────────────
   # The HPA evaluates ALL metrics and picks the highest desired replica count.
@@ -71,8 +73,8 @@ spec:
       resource:
         name: cpu
         target:
-          # averageUtilization is a percentage of the cpu *request* (500m).
-          # At 70%, the controller targets ~350m average per pod before
+          # averageUtilization is a percentage of the cpu *request* (250m).
+          # At 70%, the controller targets ~175m average per pod before
           # adding capacity — leaves 30% headroom for inference bursts.
           type: Utilization
           averageUtilization: 70
@@ -82,17 +84,18 @@ spec:
       resource:
         name: memory
         target:
-          # averageUtilization is a percentage of the memory *request* (1Gi).
-          # At 80%, the controller targets ~820Mi average per pod.
-          # ResNet-50 idles at ~680Mi; under batch load it climbs toward 1Gi.
-          # This triggers scale-up before pods risk OOM-kill at the 2Gi limit.
+          # averageUtilization is a percentage of the memory *request* (512Mi).
+          # At 80%, the controller targets ~410Mi average per pod.
+          # Single-worker ResNet-50 idles at ~350-400Mi; under batch load
+          # it climbs toward 512Mi.  This triggers scale-up before pods
+          # risk OOM-kill at the 1.5Gi limit.
           type: Utilization
           averageUtilization: 80
 
   # ── Scaling Behaviour ───────────────────────────────────────────────────────
-  # Scale-up:  react immediately to load spikes.  Allow up to 2 new pods
-  #            per 60s window — with 5 max replicas and 3 min, we reach
-  #            full capacity in a single scale-up cycle.
+  # Scale-up:  react immediately to load spikes.  Allow up to 3 new pods
+  #            per 60s window — with 10 max replicas we can ramp quickly
+  #            under heavy inference load.
   # Scale-down: very conservative — wait 300s (5 min) of sustained low
   #             utilisation, then remove only 1 pod per 180s window.
   #             This guards against premature scale-in between inference
@@ -102,7 +105,7 @@ spec:
       stabilizationWindowSeconds: 0             # react immediately to load
       policies:
         - type: Pods
-          value: 2                              # add at most 2 pods per window
+          value: 3                              # add at most 3 pods per window
           periodSeconds: 60
     scaleDown:
       stabilizationWindowSeconds: 300           # 5-min cooldown before scaling in

@@ -1,0 +1,70 @@
+###############################################################################
+# simple-model-api — ConfigMap  (FR-1 / Configuration Decoupling)
+# ────────────────────────────────────────────────────────────────
+# Externalised application configuration for the ResNet-50 inference service.
+#
+# Why a ConfigMap?
+# ────────────────
+#   Decoupling environment-specific configuration from the Deployment manifest
+#   means you can change log levels, toggle feature flags, or switch
+#   environment names WITHOUT triggering a full image rebuild or editing
+#   the Deployment spec.  A simple `kubectl apply -f configmap.yaml` followed
+#   by a rolling restart picks up new values with zero downtime.
+#
+# How it's consumed
+# ─────────────────
+#   The Deployment references this ConfigMap via `envFrom`, which injects
+#   every key below as an environment variable into the container.  Any key
+#   here can be read in Python with `os.environ.get("KEY", default)`.
+#
+# Precedence rule
+# ───────────────
+#   If the same variable is defined both here (via envFrom) AND as an
+#   explicit `env:` entry in the Deployment, the explicit `env:` entry
+#   wins.  This lets the Deployment pin critical values (PORT, TORCH_HOME)
+#   that must never be accidentally overridden.
+#
+# Quick-ref: to update a value and roll it out:
+#   kubectl apply -f kubernetes/configmap.yaml
+#   kubectl rollout restart deployment/simple-model-api-deployment
+###############################################################################
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: simple-model-api-config
+  labels:
+    app: simple-model-api
+data:
+  # ── Application Environment ──────────────────────────────────────────────
+  # Used by application code to toggle behaviour (e.g., verbose debug
+  # logging in "development", structured JSON logs in "production").
+  ENVIRONMENT: "production"
+
+  # ── Logging ──────────────────────────────────────────────────────────────
+  # Python logging level.  Valid values: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  # In production, INFO is the sensible default — DEBUG is too noisy under
+  # load and creates GC pressure from string formatting.
+  LOG_LEVEL: "INFO"
+
+  # ── Model Configuration ─────────────────────────────────────────────────
+  # These are read-only reference values the application can use for
+  # /info responses or telemetry tags.  They do NOT control model loading
+  # (that's handled by the lifespan handler in main.py).
+  MODEL_NAME: "ResNet-50"
+  MODEL_VERSION: "IMAGENET1K_V2"
+
+  # ── Inference Defaults ──────────────────────────────────────────────────
+  # Default number of top predictions returned when the client omits top_k.
+  DEFAULT_TOP_K: "5"
+
+  # Maximum upload size in bytes (10 MB).  The application also enforces
+  # this in code, but externalising it here lets you adjust both the app
+  # and Ingress proxy-body-size in tandem.
+  MAX_FILE_SIZE_BYTES: "10485760"
+
+  # ── Gunicorn / Worker Tuning ────────────────────────────────────────────
+  # These are informational — the actual Gunicorn CMD is baked into the
+  # Dockerfile.  They're surfaced here so operators can see the expected
+  # runtime configuration at a glance without inspecting the image.
+  WORKERS: "1"
+  WORKER_TIMEOUT: "120"
