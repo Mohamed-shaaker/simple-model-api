@@ -60,6 +60,10 @@ spec:
     metadata:
       labels:
         app: simple-model-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
         - name: simple-model-api

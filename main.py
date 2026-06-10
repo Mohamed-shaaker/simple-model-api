@@ -20,11 +20,14 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import torch
-from fastapi import FastAPI, File, Query, Request, UploadFile
+from fastapi import FastAPI, File, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from inference import preprocess_image
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+from metrics import INFERENCE_LATENCY, REQUEST_COUNT
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +164,30 @@ class PerformanceHeadersMiddleware(BaseHTTPMiddleware):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Prometheus request-counting middleware
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class PrometheusMiddleware(BaseHTTPMiddleware):
+    """Increment ``http_requests_total`` for every completed response.
+
+    Labels: status_code, method, endpoint.
+    Requests to ``/metrics`` are excluded to prevent recursive self-counting
+    during Prometheus scrapes.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path != "/metrics":
+            REQUEST_COUNT.labels(
+                status_code=str(response.status_code),
+                method=request.method,
+                endpoint=request.url.path,
+            ).inc()
+        return response
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Application instance
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -172,6 +199,18 @@ app = FastAPI(
 )
 
 app.add_middleware(PerformanceHeadersMiddleware)
+app.add_middleware(PrometheusMiddleware)
+
+# Expose /metrics for Prometheus scraping — unauthenticated by design;
+# access control is enforced at the network/namespace level in Kubernetes.
+# Uses a native route instead of app.mount(make_asgi_app()) because
+# BaseHTTPMiddleware strips path context from mounted ASGI sub-apps.
+
+
+@app.get("/metrics", tags=["operations"])
+async def metrics() -> Response:
+    """Prometheus scrape endpoint.  Returns all registered metrics."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -252,62 +291,23 @@ async def info(request: Request) -> JSONResponse:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  FR-2.1: POST /predict — image classification
+#  Inference pipeline (extracted for clean Prometheus latency observation)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@app.post("/predict", tags=["inference"])
-async def predict(
-    request: Request,
-    file: UploadFile = File(..., description="Image file (JPEG, PNG, BMP, TIFF, WEBP)"),
-    top_k: int = Query(
-        default=5,
-        ge=1,
-        le=10,
-        description="Number of top predictions to return (1–10).",
-    ),
+
+def _run_inference(
+    model: torch.nn.Module,
+    image_bytes: bytes,
+    top_k: int,
+    correlation_id: str,
+    filename: str | None,
 ) -> JSONResponse:
-    """Classify an uploaded image and return the top-k predictions.
+    """Execute preprocess → forward pass → postprocess, return JSONResponse.
 
-    Pipeline:
-        multipart upload → validation → preprocess_image() → model forward
-        → softmax → top-k sort → structured JSON response.
+    Extracted from the predict endpoint so the caller can wrap the single
+    call-site in try/finally for guaranteed Prometheus histogram observation
+    on every exit path — success, preprocessing failure, or OOM.
     """
-    correlation_id: str = getattr(request.state, "correlation_id", "")
-
-    # ── FR-2.2 guard: reject if model is not loaded ──────────────────
-    model = getattr(request.app.state, "model", None)
-    if model is None:
-        return _error_response(
-            status_code=503,
-            code="MODEL_NOT_LOADED",
-            message="The model is not available. Please retry after startup completes.",
-            correlation_id=correlation_id,
-        )
-
-    # ── FR-2.4: Validate file is not empty ───────────────────────────
-    image_bytes: bytes = await file.read()
-
-    if not image_bytes:
-        return _error_response(
-            status_code=400,
-            code="EMPTY_FILE",
-            message="The uploaded file is empty (0 bytes received).",
-            correlation_id=correlation_id,
-        )
-
-    # ── FR-2.4: Enforce 10 MB maximum ────────────────────────────────
-    if len(image_bytes) > MAX_FILE_SIZE_BYTES:
-        size_mb = len(image_bytes) / (1024 * 1024)
-        return _error_response(
-            status_code=413,
-            code="FILE_TOO_LARGE",
-            message=(
-                f"File size {size_mb:.1f} MB exceeds the 10 MB limit. "
-                "Please resize or compress the image."
-            ),
-            correlation_id=correlation_id,
-        )
-
     # ── FR-1.3: Preprocess (delegates to inference.py) ───────────────
     result = preprocess_image(image_bytes)
 
@@ -366,7 +366,6 @@ async def predict(
             correlation_id=correlation_id,
         )
 
-    # ── Success response ─────────────────────────────────────────────
     return JSONResponse(
         status_code=200,
         content={
@@ -375,11 +374,78 @@ async def predict(
             "meta": {
                 "model": MODEL_ARCHITECTURE,
                 "top_k": top_k,
-                "filename": file.filename,
+                "filename": filename,
             },
         },
         headers={"X-Correlation-ID": correlation_id},
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  FR-2.1: POST /predict — image classification
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/predict", tags=["inference"])
+async def predict(
+    request: Request,
+    file: UploadFile = File(..., description="Image file (JPEG, PNG, BMP, TIFF, WEBP)"),
+    top_k: int = Query(
+        default=5,
+        ge=1,
+        le=10,
+        description="Number of top predictions to return (1–10).",
+    ),
+) -> JSONResponse:
+    """Classify an uploaded image and return the top-k predictions.
+
+    Pipeline:
+        multipart upload → validation → preprocess_image() → model forward
+        → softmax → top-k sort → structured JSON response.
+    """
+    correlation_id: str = getattr(request.state, "correlation_id", "")
+
+    # ── FR-2.2 guard: reject if model is not loaded ──────────────────
+    model = getattr(request.app.state, "model", None)
+    if model is None:
+        return _error_response(
+            status_code=503,
+            code="MODEL_NOT_LOADED",
+            message="The model is not available. Please retry after startup completes.",
+            correlation_id=correlation_id,
+        )
+
+    # ── FR-2.4: Validate file is not empty ───────────────────────────
+    image_bytes: bytes = await file.read()
+
+    if not image_bytes:
+        return _error_response(
+            status_code=400,
+            code="EMPTY_FILE",
+            message="The uploaded file is empty (0 bytes received).",
+            correlation_id=correlation_id,
+        )
+
+    # ── FR-2.4: Enforce 10 MB maximum ────────────────────────────────
+    if len(image_bytes) > MAX_FILE_SIZE_BYTES:
+        size_mb = len(image_bytes) / (1024 * 1024)
+        return _error_response(
+            status_code=413,
+            code="FILE_TOO_LARGE",
+            message=(
+                f"File size {size_mb:.1f} MB exceeds the 10 MB limit. "
+                "Please resize or compress the image."
+            ),
+            correlation_id=correlation_id,
+        )
+
+    # ── Inference pipeline with Prometheus latency tracking ──────────
+    # try/finally guarantees the histogram sample is recorded on every
+    # exit path — success, preprocessing rejection, or forward-pass OOM.
+    _t0 = time.perf_counter()
+    try:
+        return _run_inference(model, image_bytes, top_k, correlation_id, file.filename)
+    finally:
+        INFERENCE_LATENCY.observe(time.perf_counter() - _t0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

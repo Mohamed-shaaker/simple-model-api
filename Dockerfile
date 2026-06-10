@@ -31,12 +31,11 @@ WORKDIR /build
 COPY requirements.txt .
 
 # Install CPU-only PyTorch from the official index to avoid pulling the
-# ~2 GB CUDA bundle.  All packages land in a virtual-env we can copy
-# cleanly into the runtime stage.
+# ~2 GB CUDA bundle.  Index configuration (CPU-only primary index) is
+# declared in requirements.txt itself — single source of truth.
 RUN python -m venv /opt/venv && \
     /opt/venv/bin/pip install --upgrade pip && \
     /opt/venv/bin/pip install --default-timeout=1000 \
-        --extra-index-url https://download.pytorch.org/whl/cpu \
         -r requirements.txt
 
 # Cache-busting bypass: Install python-multipart in a separate layer

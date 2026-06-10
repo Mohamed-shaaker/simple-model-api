@@ -1,3 +1,10 @@
+# ── Index Configuration ──────────────────────────────────────────────────
+# CPU-only PyTorch wheels as PRIMARY index — prevents pip from resolving
+# the ~2 GB CUDA bundle from PyPI.  PyPI is added as extra for everything
+# else (fastapi, gunicorn, Pillow, etc.).
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
 # ── Core Framework ───────────────────────────────────────────────────────
 fastapi>=0.110,<1.0
 uvicorn[standard]>=0.29,<1.0
@@ -7,3 +14,6 @@ gunicorn>=22.0,<23.0
 torch>=2.2,<3.0
 torchvision>=0.17,<1.0
 Pillow>=10.0,<11.0
+
+# ── Monitoring ───────────────────────────────────────────────────────────
+prometheus-client>=0.20,<1.0

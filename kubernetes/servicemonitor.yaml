@@ -1,0 +1,44 @@
+###############################################################################
+# simple-model-api — Prometheus ServiceMonitor  (Phase 2: Monitoring)
+# ────────────────────────────────────────────────────────────────────
+# Declares a ServiceMonitor CRD so the Prometheus Operator automatically
+# discovers and scrapes the application's /metrics endpoint.
+#
+# Prerequisites:
+#   1. Prometheus Operator (or kube-prometheus-stack) installed in the cluster.
+#   2. The operator's serviceMonitorSelector must match the labels below.
+#      The default kube-prometheus-stack Helm chart selects on
+#      `release: prometheus` — adjust if your installation differs.
+#
+# Traffic flow:
+#   Prometheus  ──►  Service :80 (http)  ──►  Pod :8000 /metrics
+#
+# The scrape interval (15s) is aggressive enough for autoscaling signal
+# fidelity without creating excessive load on a single-worker process.
+###############################################################################
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: simple-model-api-monitor
+  labels:
+    app: simple-model-api
+    # Must match Prometheus Operator's serviceMonitorSelector.
+    # Default for kube-prometheus-stack Helm chart:
+    release: prometheus
+spec:
+  # ── Target Service Selection ───────────────────────────────────────────
+  selector:
+    matchLabels:
+      app: simple-model-api
+
+  # ── Namespace Scope ────────────────────────────────────────────────────
+  namespaceSelector:
+    matchNames:
+      - default
+
+  # ── Scrape Configuration ───────────────────────────────────────────────
+  endpoints:
+    - port: http              # matches the named port in service.yaml
+      path: /metrics
+      interval: 15s           # tight loop for HPA signal fidelity
+      scrapeTimeout: 10s      # generous for slow cold-start pods
