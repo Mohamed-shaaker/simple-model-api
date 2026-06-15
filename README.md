@@ -1,10 +1,8 @@
 # Simple Model API
 
-Production-grade image classification service built on ResNet-50 and FastAPI, designed to run as a horizontally-scalable microservice inside Kubernetes.
+Image classification service built on ResNet-50 and FastAPI, running as a horizontally-scalable microservice inside Kubernetes.
 
-The service accepts an image upload, runs it through a pre-trained ResNet-50 (ImageNet V2 weights), and returns the top-k predicted classes with confidence scores — all behind structured JSON responses, correlation-ID tracing, and Prometheus-native observability.
-
----
+The service accepts an image upload, runs it through a pre-trained ResNet-50 (ImageNet V2 weights), and returns the top-k predicted classes with confidence scores. Responses are structured JSON with correlation-ID headers; metrics are exposed natively to Prometheus.
 
 ## Architecture
 
@@ -30,35 +28,35 @@ Client (curl / browser / load sim)
   ResNet-50 (baked weights)
 ```
 
-Each pod runs a single Gunicorn worker with a Uvicorn async event loop. Model weights are baked into the Docker image at build time, so containers never hit the network on startup.
-
----
+Each pod runs a single Gunicorn worker with a Uvicorn async event loop. Model weights are baked into the Docker image at build time, so containers have no network calls on startup.
 
 ## API
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/predict` | Classify an uploaded image. Returns top-k predictions with confidence scores. |
-| `GET` | `/health` | Model-aware readiness probe. Returns `200` when the model is loaded, `503` otherwise. |
-| `GET` | `/info` | Static service metadata — model architecture, preprocessing config, constraints. |
-| `GET` | `/metrics` | Prometheus scrape endpoint. Exposes `model_inference_duration_seconds` histogram and `http_requests_total` counter. |
+| POST | /predict | Classify an uploaded image. Returns top-k predictions with confidence scores. |
+| GET | /health | Model-aware readiness probe. Returns 200 when the model is loaded, 503 otherwise. |
+| GET | /info | Static service metadata: model architecture, preprocessing config, constraints. |
+| GET | /metrics | Prometheus scrape endpoint. Exposes `model_inference_duration_seconds` histogram and `http_requests_total` counter. |
 
 ### POST /predict
 
-**Request:**
+Request:
+
 ```bash
 curl -X POST http://model-api.local/predict \
   -F "file=@dog.jpg" \
   -H "Host: model-api.local"
 ```
 
-**Query parameters:**
+Query parameters:
 
 | Parameter | Type | Default | Range | Description |
 |-----------|------|---------|-------|-------------|
-| `top_k` | int | 5 | 1–10 | Number of top predictions to return. |
+| top_k | int | 5 | 1–10 | Number of top predictions to return. |
 
-**Response (200):**
+Response (200):
+
 ```json
 {
   "success": true,
@@ -78,15 +76,14 @@ curl -X POST http://model-api.local/predict \
 }
 ```
 
-**Constraints:**
+Constraints:
+
 - Max file size: 10 MB
 - Accepted formats: JPEG, PNG, BMP, TIFF, WEBP
 
 Every response includes `X-Correlation-ID` and `X-Response-Time` headers for distributed tracing.
 
----
-
-## Project Structure
+## Project structure
 
 ```
 simple-model-api/
@@ -106,9 +103,7 @@ simple-model-api/
     └── servicemonitor.yaml    # Prometheus Operator auto-discovery CRD
 ```
 
----
-
-## Quick Start
+## Quick start
 
 ### Docker Compose (local)
 
@@ -116,7 +111,7 @@ simple-model-api/
 docker compose up --build
 ```
 
-The service starts on `http://localhost:8000`. First build downloads ResNet-50 weights (~100 MB) and bakes them into the image. Subsequent rebuilds skip this layer unless dependencies change.
+The service starts on `http://localhost:8000`. The first build downloads ResNet-50 weights (~100 MB) and bakes them into the image. Subsequent rebuilds skip this layer unless dependencies change.
 
 ```bash
 # Health check
@@ -160,7 +155,7 @@ echo "$(minikube ip) model-api.local" | sudo tee -a /etc/hosts
 Add-Content C:\Windows\System32\drivers\etc\hosts "$(minikube ip) model-api.local"
 ```
 
-Then hit the service through ingress:
+Then send requests through the ingress:
 
 ```bash
 curl -X POST http://model-api.local/predict \
@@ -168,20 +163,18 @@ curl -X POST http://model-api.local/predict \
   -H "Host: model-api.local"
 ```
 
----
-
 ## Monitoring
 
-The service exposes Prometheus metrics natively on `/metrics`:
+The service exposes Prometheus metrics on `/metrics`:
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `model_inference_duration_seconds` | Histogram | End-to-end latency of the inference pipeline (preprocess + forward pass + postprocess). |
-| `http_requests_total` | Counter | Total HTTP requests, labelled by `status_code`, `method`, `endpoint`. |
+| model_inference_duration_seconds | Histogram | End-to-end latency of the inference pipeline (preprocess + forward pass + postprocess). |
+| http_requests_total | Counter | Total HTTP requests, labelled by status_code, method, endpoint. |
 
 ### Prometheus Operator
 
-A `ServiceMonitor` CRD is provided for automatic scrape target discovery. If running `kube-prometheus-stack`, apply it after the stack is installed:
+A ServiceMonitor CRD is included for automatic scrape target discovery. If running kube-prometheus-stack, apply it after the stack is installed:
 
 ```bash
 kubectl apply -f kubernetes/servicemonitor.yaml
@@ -189,11 +182,9 @@ kubectl apply -f kubernetes/servicemonitor.yaml
 
 The ServiceMonitor scrapes every 15 seconds on the named port `http`.
 
----
+## Load testing
 
-## Load Testing
-
-The included `batch_inference_client.py` is an async load simulator that fires concurrent image uploads to stress-test the HPA autoscaler:
+`batch_inference_client.py` is an async load simulator for stress-testing the HPA autoscaler:
 
 ```bash
 # Default: 50 requests, 10 concurrent
@@ -209,39 +200,36 @@ python batch_inference_client.py --waves 3 --requests 100
 python batch_inference_client.py --url http://127.0.0.1/predict --host model-api.local
 ```
 
-Results are exported to `inference_results.json` with per-request latency, status codes, and aggregate metrics (p50/p95/p99, RPS, success rate).
+Results are written to `inference_results.json` with per-request latency, status codes, and aggregate metrics (p50/p95/p99, RPS, success rate).
 
----
-
-## Resource Budget
+## Resource budget
 
 | Resource | Request (guaranteed) | Limit (ceiling) |
-|----------|---------------------|-----------------|
+|----------|----------------------|-----------------|
 | CPU | 250m | 1000m |
 | Memory | 512 Mi | 1536 Mi (1.5 Gi) |
 
-The HPA scales between 3 and 10 replicas. Scale-up triggers at 70% CPU or 80% memory utilisation. Scale-down is conservative: 5-minute stabilisation window, removing at most 1 pod every 3 minutes.
+The HPA scales between 3 and 10 replicas. Scale-up triggers at 70% CPU or 80% memory utilisation. Scale-down uses a 5-minute stabilisation window, removing at most one pod every 3 minutes.
 
----
+## Key design decisions
 
-## Key Design Decisions
+**Baked model weights.** ResNet-50 weights are downloaded at Docker build time and cached in `/opt/torch_cache`. Containers have no network calls at runtime.
 
-- **Baked model weights.** ResNet-50 weights are downloaded at Docker build time and cached in `/opt/torch_cache`. Containers are fully offline at runtime — no network calls on startup.
-- **CPU-only PyTorch.** `requirements.txt` uses the CPU-only PyTorch index as primary, avoiding the ~2 GB CUDA bundle.
-- **Single Gunicorn worker per pod.** Scales horizontally via HPA rather than vertically via process count. Keeps memory footprint predictable and avoids GIL contention in the PyTorch forward pass.
-- **Three-probe health strategy.** `startupProbe` gates the boot sequence (up to 5 minutes), `readinessProbe` controls Service traffic, and `livenessProbe` auto-restarts frozen processes — each with tuned delays to prevent false kills.
-- **Structured error responses.** Every error returns a uniform JSON envelope with a `code`, `message`, and `X-Correlation-ID` header. Clients parse failures the same way regardless of the error source.
-- **Defensive OOM handling.** All PyTorch `RuntimeError` exceptions (CUDA OOM, dimension mismatch) are caught, logged at CRITICAL, and converted to clean HTTP responses. The worker process never crashes.
+**CPU-only PyTorch.** `requirements.txt` uses the CPU-only PyTorch index, avoiding the ~2 GB CUDA bundle.
 
----
+**Single Gunicorn worker per pod.** The service scales horizontally via HPA rather than vertically via process count. This keeps memory footprint predictable and avoids GIL contention in the PyTorch forward pass.
+
+**Three-probe health strategy.** `startupProbe` gates the boot sequence (up to 5 minutes), `readinessProbe` controls Service traffic, and `livenessProbe` auto-restarts frozen processes, each with tuned delays to prevent false kills.
+
+**Structured error responses.** Every error returns a uniform JSON envelope with a `code`, `message`, and `X-Correlation-ID` header. Clients parse failures the same way regardless of error source.
+
+**Defensive OOM handling.** All PyTorch `RuntimeError` exceptions (CUDA OOM, dimension mismatch) are caught, logged at `CRITICAL`, and converted to clean HTTP responses. The worker process does not crash.
 
 ## Requirements
 
 - Python 3.10+
 - Docker (or Minikube with Docker driver)
 - For Kubernetes: `kubectl`, Minikube, and optionally `kube-prometheus-stack` for monitoring
-
----
 
 ## License
 
