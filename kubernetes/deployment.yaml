@@ -6,11 +6,11 @@
 # Key design decisions
 #   • replicas: 3         → matches HPA minReplicas for immediate HA.
 #   • RollingUpdate       → maxSurge=1, maxUnavailable=0 for zero-downtime.
-#   • Resource budget     → requests 250m/512Mi, limits 1000m/1.5Gi.
-#                           Conservative requests let the HPA pack more pods
-#                           onto a resource-constrained Minikube node while
-#                           the generous limits (4× CPU, 3× memory) give
-#                           each pod room to burst during inference spikes.
+#   • Resource budget     → requests 500m/512Mi, limits 2000m/2Gi.
+#                           The 500m CPU request prevents CFS throttling
+#                           during the ~97s tensor deserialization at startup.
+#                           2-core limit lets the pod burst for inference
+#                           while being Minikube-friendly.
 #   • imagePullPolicy     → IfNotPresent (local Minikube-built image).
 #   • envFrom ConfigMap   → decouples LOG_LEVEL, ENVIRONMENT, etc. from
 #                           this manifest.  Change config without redeploying.
@@ -18,19 +18,21 @@
 # Health probe timing rationale
 # ─────────────────────────────
 #   The ResNet-50 lifespan handler performs:
-#     1. Weight deserialization from baked TORCH_HOME (~2-5s, no network).
+#     1. Weight deserialization from baked TORCH_HOME (~70-97s on local CPUs).
 #     2. model.eval() mode switch.
 #     3. Warm-up forward pass (torch.randn → model → dispatch tables).
 #     4. ImageNet label list eager-load.
-#   Total cold-start budget: ~10-15s on local clusters, up to ~30s under
-#   node resource contention.
+#   Total cold-start budget: ~97s observed, up to ~120s under heavy node
+#   resource contention.
 #
-#   startupProbe  — gates ALL other probes.  30 × 10s = 300s max runway
-#                   absorbs worst-case slow nodes without false-killing.
-#   readinessProbe — 30s initialDelay lets the lifespan finish before
-#                    kube-proxy adds the pod to Service endpoints.
-#   livenessProbe  — 45s initialDelay (> readiness) so a healthy pod is
-#                    never restarted during its first readiness window.
+#   startupProbe   — gates ALL other probes.  18 × 10s = 180s (~3 min)
+#                    protective shield absorbs the full model load window
+#                    without false-killing pods.
+#   readinessProbe — no initialDelay needed: Kubernetes holds readiness
+#                    checks until startupProbe passes.  Runs every 5s for
+#                    fast Service endpoint registration.
+#   livenessProbe  — no initialDelay needed: also gated behind startup.
+#                    Runs every 15s to auto-restart frozen processes.
 #
 # Quick-ref configurable values (search & replace):
 #   CONTAINER_PORT  →  8000
@@ -80,72 +82,94 @@ spec:
               protocol: TCP
 
           # ── Resource Budgets ────────────────────────────────────────────────
+          #
           # Requests  = guaranteed baseline the scheduler reserves on the node.
-          #             250m CPU is conservative — with single-worker Gunicorn,
-          #             CPU usage per pod is modest at idle.  The HPA uses
-          #             this as denominator: 70% target ≈ 175m avg before
-          #             scale-up, which is responsive to real inference load.
-          #             512Mi memory covers ResNet-50 idle (~350-400Mi for a
-          #             single worker) with safe headroom.
+          #
+          #   CPU 500m  — doubled from 250m.  During the ~97s model load phase,
+          #     PyTorch deserializes ~100MB of ResNet-50 tensors.  At 250m the
+          #     kernel's CFS bandwidth controller throttles the process,
+          #     extending cold start by 30-40%.  500m gives the single Gunicorn
+          #     worker half a core — enough to avoid throttling while still
+          #     letting the HPA pack 3 pods on a 4-core Minikube node.
+          #
+          #   Memory 512Mi — unchanged.  ResNet-50 idle footprint is ~350-400Mi
+          #     for a single worker; 512Mi covers it with headroom.
+          #
           # Limits    = hard ceiling the kubelet enforces (OOM-kill / throttle).
-          #             1000m CPU prevents any single pod from starving others.
-          #             1.5Gi memory prevents OOM during matrix operations
-          #             while being conservative for local machine hosting.
+          #
+          #   CPU 2000m — doubled from 1000m.  During inference the model
+          #     dispatches through libtorch which can utilise >1 core for
+          #     GEMM ops.  2 cores lets it burst without starving the node
+          #     (Minikube default is 4 cores).
+          #
+          #   Memory 2Gi — raised from 1.5Gi.  Under concurrent inference
+          #     each request allocates transient tensors (~20-40Mi per image
+          #     through the full ResNet pipeline).  2Gi prevents OOM kills
+          #     during traffic spikes while being conservative for local dev.
+          #
           resources:
             requests:
-              cpu: "250m"
+              cpu: "500m"
               memory: "512Mi"
             limits:
-              cpu: "1000m"
-              memory: "1536Mi"
+              cpu: "2000m"
+              memory: "2Gi"
 
           # ── Health & Self-Healing Probes ─────────────────────────────────────
           #
           # Three-probe strategy for robust lifecycle management:
           #
-          #  1. startupProbe   — gates initial boot (model weight deserialization
-          #                      + warm-up forward pass).  Prevents liveness from
-          #                      killing a slow-starting pod.
-          #                      30 × 10s = 300s (~5 min) max before K8s gives up.
+          # IMPORTANT: startupProbe gates readinessProbe and livenessProbe.
+          # Kubernetes will NOT run readiness/liveness checks until the startup
+          # probe succeeds at least once.  This eliminates the need for
+          # initialDelaySeconds on the other two probes.
           #
-          #  2. readinessProbe — blocks Service traffic until /health returns 200.
-          #                      30s initial delay covers the typical 10-15s model
-          #                      load plus warm-up, with safety margin for node
-          #                      resource contention.
+          #  1. startupProbe   — protective shield during model loading.
+          #                      The ResNet-50 tensor deserialization takes ~97s
+          #                      on shared local CPUs.  We budget:
+          #                        18 failures × 10s period = 180s (~3 min)
+          #                      This comfortably covers the observed 97s load
+          #                      time with ~83s of headroom for resource
+          #                      contention on busy Minikube nodes.
           #
-          #  3. livenessProbe  — auto-restarts if the Python process freezes or
-          #                      deadlocks.  45s initial delay is deliberately
-          #                      higher than readiness to avoid false restarts
-          #                      during the startup window.
+          #  2. readinessProbe — blocks Service traffic until /health → 200.
+          #                      Runs immediately once startup passes.
+          #                      5s period ≈ pod is routable within seconds of
+          #                      readiness.
+          #
+          #  3. livenessProbe  — auto-restarts if the Python process freezes,
+          #                      deadlocks, or the model enters a corrupt state.
+          #                      3 failures × 15s = 45s to detect a hang.
           #
           startupProbe:
             httpGet:
               path: /health
-              port: 8000
-            initialDelaySeconds: 5      # weights baked in — fast cold start
-            periodSeconds: 10           # poll every 10s during boot
-            timeoutSeconds: 5
-            failureThreshold: 30        # 30 × 10s = 300s max startup budget
+              port: http
+            initialDelaySeconds: 5      # give Gunicorn 5s to bind the socket
+            periodSeconds: 10           # poll every 10s during model loading
+            timeoutSeconds: 5           # single /health call should be instant
+            successThreshold: 1         # one 200 OK = model is loaded
+            failureThreshold: 18        # 18 × 10s = 180s max startup budget
 
           readinessProbe:
             httpGet:
               path: /health
-              port: 8000
-            initialDelaySeconds: 30     # wait for ResNet-50 lifespan to complete
+              port: http
+            # No initialDelaySeconds — gated behind startupProbe
             periodSeconds: 5            # check frequently — fast traffic gating
             timeoutSeconds: 5
             successThreshold: 1
-            failureThreshold: 3
+            failureThreshold: 3         # 3 × 5s = 15s before removing from LB
 
           livenessProbe:
             httpGet:
               path: /health
-              port: 8000
-            initialDelaySeconds: 45     # > readiness delay; avoids false kill
+              port: http
+            # No initialDelaySeconds — gated behind startupProbe
             periodSeconds: 15           # auto-restart frozen Python within ~45s
             timeoutSeconds: 5
             successThreshold: 1
-            failureThreshold: 3
+            failureThreshold: 3         # 3 × 15s = 45s to confirm dead process
 
           # ── Environment Variables ───────────────────────────────────────────
           # envFrom injects ALL keys from the ConfigMap as env vars.

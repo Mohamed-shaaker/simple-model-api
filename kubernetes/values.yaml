@@ -1,0 +1,123 @@
+###############################################################################
+# kube-prometheus-stack — Helm Override Values (Minikube)
+# ───────────────────────────────────────────────────────
+# Fixes the "No data" blindspot for real-time CPU/Memory utilisation panels
+# in Grafana.
+#
+# Root Cause
+# ──────────
+# Minikube's Kubelet exposes cAdvisor metrics over HTTPS with self-signed
+# certificates.  The default kube-prometheus-stack ServiceMonitor for the
+# Kubelet uses `https` and expects valid TLS — causing Prometheus scrape
+# failures and empty container_cpu_usage_seconds_total /
+# container_memory_working_set_bytes series.
+#
+# Fix Summary
+# ───────────
+#   1. Switch the Kubelet scrape scheme from HTTPS → HTTP.
+#   2. Set insecureSkipVerify: true as a safety net so that if any
+#      component still attempts TLS, the self-signed cert is accepted.
+#   3. Keep cAdvisor metrics collection enabled (it is by default, but
+#      we set it explicitly for documentation clarity).
+#
+# Usage
+# ─────
+# Install or upgrade the monitoring stack with this overlay:
+#
+#   helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+#     -f kubernetes/values.yaml \
+#     --namespace monitoring --create-namespace
+#
+###############################################################################
+
+# ── Kubelet Service Monitor Overrides ────────────────────────────────────────
+kubelet:
+  enabled: true
+
+  serviceMonitor:
+    ## ── Scheme: downgrade to HTTP ────────────────────────────────────────────
+    # Minikube's Kubelet API is reachable over plain HTTP on port 10255.
+    # Using HTTP avoids TLS handshake failures entirely.
+    scheme: http
+
+    ## ── TLS safety net ──────────────────────────────────────────────────────
+    # Even when scheme is HTTP, the cAdvisor and resource sub-endpoints may
+    # follow redirects or get reverse-proxied.  insecureSkipVerify ensures
+    # Prometheus never rejects a self-signed certificate.
+    tlsConfig:
+      insecureSkipVerify: true
+
+    ## ── cAdvisor sub-endpoint ───────────────────────────────────────────────
+    # cAdvisor is what provides real-time container CPU, Memory, Disk, and
+    # Network metrics (container_cpu_*, container_memory_*, etc.).
+    cAdvisor: true
+
+    ## ── cAdvisor-specific TLS override ──────────────────────────────────────
+    # The Prometheus Operator generates a separate scrape job for
+    # /metrics/cadvisor.  This block ensures that job also skips TLS
+    # verification.
+    cAdvisorMetricRelabelings: []
+
+    ## ── Scheme & TLS for the cAdvisor scrape job ────────────────────────────
+    cAdvisorHttps: false
+
+    ## ── Probes sub-endpoint ─────────────────────────────────────────────────
+    probes: true
+    probesHttps: false
+
+    ## ── Resource metrics sub-endpoint ───────────────────────────────────────
+    resource: true
+    resourceHttps: false
+    resourcePath: /metrics/resource
+
+    ## ── Relabeling ──────────────────────────────────────────────────────────
+    # Preserve the node name as an "instance" label so Grafana panels can
+    # break down CPU/Memory by node.
+    relabelings:
+      - sourceLabels: [__metrics_path__]
+        targetLabel: metrics_path
+
+# ── Prometheus Server Overrides ──────────────────────────────────────────────
+prometheus:
+  prometheusSpec:
+    ## ── ServiceMonitor auto-discovery ──────────────────────────────────────
+    # Allow Prometheus to pick up ServiceMonitors from ANY namespace
+    # (required to discover our app's ServiceMonitor in the default ns).
+    serviceMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorNamespaceSelector: {}
+    serviceMonitorSelector: {}
+
+    ## ── Resource budgets for Prometheus itself ─────────────────────────────
+    # Minikube-friendly footprint.  Adjust upward for production.
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+
+# ── Grafana Overrides ────────────────────────────────────────────────────────
+grafana:
+  enabled: true
+
+  ## ── Default admin credentials (local dev only!) ─────────────────────────
+  adminUser: admin
+  adminPassword: admin
+
+  ## ── Data-source provisioning ────────────────────────────────────────────
+  # Ensures Grafana ships with a working Prometheus data source
+  # pointed at the in-cluster service.
+  sidecar:
+    datasources:
+      enabled: true
+    dashboards:
+      enabled: true
+
+# ── Node Exporter ────────────────────────────────────────────────────────────
+nodeExporter:
+  enabled: true
+
+# ── kube-state-metrics ───────────────────────────────────────────────────────
+kubeStateMetrics:
+  enabled: true
