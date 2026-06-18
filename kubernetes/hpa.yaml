@@ -2,15 +2,16 @@
 # simple-model-api — Horizontal Pod Autoscaler  (FR-3)
 # ─────────────────────────────────────────────────────
 # ML-optimised autoscaler for a ResNet-50 FastAPI service running in Minikube.
-# Scales the Deployment between 3 and 10 replicas based on both CPU and Memory
+# Scales the Deployment between 2 and 10 replicas based on both CPU and Memory
 # utilisation reported by the Metrics Server.
 #
-# Why minReplicas = 3?
+# Why minReplicas = 2?
 # ────────────────────
-#   ResNet-50 model loading takes several seconds (cold start).  Keeping 3
-#   pods warm at all times means at least 2 hot standbys are always ready
-#   to absorb traffic while the third may be mid-inference.  This eliminates
-#   user-facing latency spikes from cold PyTorch model loads.
+#   ResNet-50 model loading takes several seconds (cold start).  Keeping 2
+#   pods warm at all times means 1 hot standby is always ready to absorb
+#   traffic while the other may be mid-inference.  Lowered from 3 to leave
+#   enough CPU headroom for the kube-prometheus-stack (Grafana, Alertmanager,
+#   Prometheus) on a resource-constrained Minikube node.
 #
 # How the scaling math works (CPU)
 # ────────────────────────────────
@@ -39,7 +40,7 @@
 #   • The Deployment must have cpu AND memory resource requests defined.
 #
 # Quick-ref configurable values (search & replace):
-#   MIN_REPLICAS              →  3
+#   MIN_REPLICAS              →  2
 #   MAX_REPLICAS              →  10
 #   CPU_TARGET_UTILIZATION    →  70
 #   MEMORY_TARGET_UTILIZATION →  80
@@ -58,11 +59,11 @@ spec:
     name: simple-model-api-deployment
 
   # ── Replica Bounds ──────────────────────────────────────────────────────────
-  # min 3:  always keep hot standbys to avoid cold-start model loads.
-  # max 10: with conservative 250m/512Mi requests, 10 pods require
-  #         2500m CPU / 5Gi memory — fits comfortably on a Minikube node
+  # min 2:  keep a hot standby while leaving CPU for monitoring stack.
+  # max 10: with conservative 500m/512Mi requests, 10 pods require
+  #         5000m CPU / 5Gi memory — fits comfortably on a Minikube node
   #         with 4+ cores and 8GB+ RAM, leaving headroom for system pods.
-  minReplicas: 3
+  minReplicas: 2
   maxReplicas: 10
 
   # ── Scaling Metrics ─────────────────────────────────────────────────────────

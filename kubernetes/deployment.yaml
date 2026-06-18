@@ -4,7 +4,7 @@
 # Production-grade manifest for the ResNet-50 image classification service.
 #
 # Key design decisions
-#   • replicas: 3         → matches HPA minReplicas for immediate HA.
+#   • replicas: 2         → matches HPA minReplicas; fits alongside monitoring stack.
 #   • RollingUpdate       → maxSurge=1, maxUnavailable=0 for zero-downtime.
 #   • Resource budget     → requests 500m/512Mi, limits 2000m/2Gi.
 #                           The 500m CPU request prevents CFS throttling
@@ -37,7 +37,7 @@
 # Quick-ref configurable values (search & replace):
 #   CONTAINER_PORT  →  8000
 #   IMAGE_TAG       →  simple-model-api:latest
-#   REPLICAS        →  3
+#   REPLICAS        →  2
 ###############################################################################
 apiVersion: apps/v1
 kind: Deployment
@@ -46,7 +46,7 @@ metadata:
   labels:
     app: simple-model-api
 spec:
-  replicas: 3
+  replicas: 2
   selector:
     matchLabels:
       app: simple-model-api
