@@ -1,17 +1,4 @@
-###############################################################################
-# simple-model-api — GitHub Actions CI/CD Pipeline
-# ──────────────────────────────────────────────────
-# Triggers on every push to `main`.
-# Builds the Docker image, tags it with :latest and :sha-<commit>,
-# and pushes both tags to GitHub Container Registry (ghcr.io).
-#
-# Cost: $0.00 — uses GitHub's free ubuntu-latest runners and the free
-#        ghcr.io package registry included with every GitHub account.
-#
-# Required secrets: NONE — GITHUB_TOKEN is automatically injected by Actions.
-###############################################################################
-
-name: CI/CD — Build & Push to GHCR
+name: CI/CD — Test, Build & Push to GHCR
 
 on:
   push:
@@ -19,38 +6,65 @@ on:
       - main
 
 env:
-  # Full image name on ghcr.io — lower-cased (OCI registry requirement).
   IMAGE_NAME: ghcr.io/mohamed-shaaker/simple-model-api
 
 jobs:
+  # ── Job 1: Run test suite ─────────────────────────────────────────────────
+  # The build-and-push job only runs when this passes, making tests a hard gate.
+  test:
+    name: Run Pytest Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ──────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install CPU-only dependencies (avoids the 2 GB CUDA wheel) ────
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+                      --extra-index-url https://pypi.org/simple \
+                      -r requirements.txt
+
+      # ── 4. Run tests ──────────────────────────────────────────────────────
+      - name: Run pytest
+        run: python -m pytest tests/ -v --tb=short
+
+  # ── Job 2: Build and push Docker image ────────────────────────────────────
+  # Only runs after the test job passes — broken code never reaches GHCR.
   build-and-push:
     name: Build Docker Image & Push to GHCR
     runs-on: ubuntu-latest
+    needs: test   # hard dependency: skip build if tests fail
 
-    # Grant the GITHUB_TOKEN permission to write packages (push images).
     permissions:
       contents: read
       packages: write
 
     steps:
-      # ── 1. Checkout source code ────────────────────────────────────────────
+      # ── 1. Checkout source code ───────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Compute the short Git SHA for the image tag ────────────────────
-      #   Result: e.g. "sha-a1b2c3d"
-      #   Stored in: ${{ steps.vars.outputs.sha_short }}
+      # ── 2. Compute the short Git SHA for the image tag ───────────────────
       - name: Set short SHA output
         id: vars
         run: echo "sha_short=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
-      # ── 3. Set up Docker Buildx (multi-platform builder) ──────────────────
-      #   Required for advanced caching features used in step 5.
+      # ── 3. Set up Docker Buildx ───────────────────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       # ── 4. Log in to GitHub Container Registry ────────────────────────────
-      #   GITHUB_TOKEN is automatically provided — no manual secret needed.
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -58,13 +72,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 5. Build and push the Docker image ────────────────────────────────
-      #   Tags pushed:
-      #     • ghcr.io/mohamed-shaaker/simple-model-api:latest
-      #     • ghcr.io/mohamed-shaaker/simple-model-api:sha-<commit>
-      #
-      #   Cache strategy: GHA cache backend avoids re-pulling the ~2 GB
-      #   PyTorch layer on every run — keeps builds fast after the first run.
+      # ── 5. Build and push the Docker image ───────────────────────────────
       - name: Build and push image
         uses: docker/build-push-action@v5
         with:
@@ -74,7 +82,6 @@ jobs:
           tags: |
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.sha_short }}
-          # Layer-cache persisted across runs via GitHub Actions cache.
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

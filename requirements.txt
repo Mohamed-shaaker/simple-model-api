@@ -9,6 +9,7 @@
 fastapi>=0.110,<1.0
 uvicorn[standard]>=0.29,<1.0
 gunicorn>=22.0,<23.0
+python-multipart>=0.0.9,<1.0
 
 # ── ML / Vision ──────────────────────────────────────────────────────────
 torch>=2.2,<3.0
@@ -17,3 +18,7 @@ Pillow>=10.0,<11.0
 
 # ── Monitoring ───────────────────────────────────────────────────────────
 prometheus-client>=0.20,<1.0
+
+# ── Testing (not installed in production image) ───────────────────────────
+pytest>=8.0,<9.0
+httpx>=0.27,<1.0

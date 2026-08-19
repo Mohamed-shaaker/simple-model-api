@@ -1,44 +1,29 @@
-###############################################################################
-# simple-model-api — Kubernetes Deployment  (FR-1 / FR-3)
-# ─────────────────────────────────────────────────────────
-# Production-grade manifest for the ResNet-50 image classification service.
+﻿# simple-model-api - Kubernetes Deployment (FR-1 / FR-3)
 #
-# Key design decisions
-#   • replicas: 2         → matches HPA minReplicas; fits alongside monitoring stack.
-#   • RollingUpdate       → maxSurge=1, maxUnavailable=0 for zero-downtime.
-#   • Resource budget     → requests 500m/512Mi, limits 2000m/2Gi.
-#                           The 500m CPU request prevents CFS throttling
-#                           during the ~97s tensor deserialization at startup.
-#                           2-core limit lets the pod burst for inference
-#                           while being Minikube-friendly.
-#   • imagePullPolicy     → IfNotPresent (local Minikube-built image).
-#   • envFrom ConfigMap   → decouples LOG_LEVEL, ENVIRONMENT, etc. from
-#                           this manifest.  Change config without redeploying.
+# Key design decisions:
+#   replicas: 2         matches HPA minReplicas; fits alongside monitoring stack.
+#   RollingUpdate       maxSurge=1, maxUnavailable=0 for zero-downtime.
+#   Resource budget     requests 500m/512Mi, limits 2000m/2Gi.
+#                       500m CPU prevents CFS throttling during the ~97s model
+#                       deserialization at startup. 2-core limit lets the pod
+#                       burst for inference while remaining Minikube-friendly.
+#   imagePullPolicy     Always - ensures `kubectl rollout restart` fetches the
+#                       newest :latest digest from GHCR without a tag change.
+#   envFrom ConfigMap   decouples LOG_LEVEL, ENVIRONMENT, etc. from this manifest.
 #
-# Health probe timing rationale
-# ─────────────────────────────
-#   The ResNet-50 lifespan handler performs:
-#     1. Weight deserialization from baked TORCH_HOME (~70-97s on local CPUs).
-#     2. model.eval() mode switch.
-#     3. Warm-up forward pass (torch.randn → model → dispatch tables).
-#     4. ImageNet label list eager-load.
-#   Total cold-start budget: ~97s observed, up to ~120s under heavy node
-#   resource contention.
+# Health probe timing rationale:
+#   ResNet-50 lifespan performs: weight deserialization (~70-97s on local CPUs),
+#   model.eval(), a warm-up forward pass, and ImageNet label eager-load.
+#   Total cold-start budget: ~97s observed, up to ~120s under heavy contention.
 #
-#   startupProbe   — gates ALL other probes.  18 × 10s = 180s (~3 min)
-#                    protective shield absorbs the full model load window
-#                    without false-killing pods.
-#   readinessProbe — no initialDelay needed: Kubernetes holds readiness
-#                    checks until startupProbe passes.  Runs every 5s for
-#                    fast Service endpoint registration.
-#   livenessProbe  — no initialDelay needed: also gated behind startup.
-#                    Runs every 15s to auto-restart frozen processes.
+#   startupProbe   18 x 10s = 180s budget (~3 min); gates ALL other probes.
+#   readinessProbe no initialDelay (gated by startup); 5s period for fast LB registration.
+#   livenessProbe  no initialDelay (gated by startup); 3 x 15s = 45s to detect a hang.
 #
-# Quick-ref configurable values (search & replace):
-#   CONTAINER_PORT  →  8000
-#   IMAGE_TAG       →  ghcr.io/mohamed-shaaker/simple-model-api:latest
-#   REPLICAS        →  2
-###############################################################################
+# Quick-ref values:
+#   CONTAINER_PORT  8000
+#   IMAGE_TAG       ghcr.io/mohamed-shaaker/simple-model-api:latest
+#   REPLICAS        2
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -51,12 +36,11 @@ spec:
     matchLabels:
       app: simple-model-api
 
-  # ── Rolling-update strategy (zero-downtime deploys) ───────────────────────
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 1            # spin up 1 extra pod before removing old ones
-      maxUnavailable: 0      # never take an existing pod offline until replacement is Ready
+      maxSurge: 1        # spin up 1 extra pod before removing old ones
+      maxUnavailable: 0  # never take an existing pod offline until replacement is Ready
 
   template:
     metadata:
@@ -67,24 +51,14 @@ spec:
         prometheus.io/port: "8000"
         prometheus.io/path: "/metrics"
     spec:
-      # ── Pull credentials for ghcr.io ──────────────────────────────────────
-      # The ghcr-credentials secret is a docker-registry type secret.
-      # Create it once locally with the one-liner in the CI/CD guide.
-      # If you make the GHCR package Public this block can be removed.
       imagePullSecrets:
         - name: ghcr-credentials
       containers:
         - name: simple-model-api
-          # Image lives on GitHub Container Registry, pushed by CI/CD pipeline.
           # CI pushes two tags per commit:
-          #   :latest           → always the most recent build of main
-          #   :sha-<short-sha>  → immutable per-commit tag for rollbacks
+          #   :latest          - always the most recent build of main
+          #   :sha-<short-sha> - immutable per-commit tag for rollbacks
           image: ghcr.io/mohamed-shaaker/simple-model-api:latest
-
-          # ── Always pull from ghcr.io on rollout ─────────────────────────────
-          # Changed from IfNotPresent (Minikube local images) to Always so that
-          # `kubectl rollout restart` fetches the newest :latest digest from GHCR
-          # without needing to change the tag in this manifest.
           imagePullPolicy: Always
 
           ports:
@@ -92,101 +66,43 @@ spec:
               containerPort: 8000
               protocol: TCP
 
-          # ── Resource Budgets ────────────────────────────────────────────────
-          #
-          # Requests  = guaranteed baseline the scheduler reserves on the node.
-          #
-          #   CPU 500m  — doubled from 250m.  During the ~97s model load phase,
-          #     PyTorch deserializes ~100MB of ResNet-50 tensors.  At 250m the
-          #     kernel's CFS bandwidth controller throttles the process,
-          #     extending cold start by 30-40%.  500m gives the single Gunicorn
-          #     worker half a core — enough to avoid throttling while still
-          #     letting the HPA pack 3 pods on a 4-core Minikube node.
-          #
-          #   Memory 512Mi — unchanged.  ResNet-50 idle footprint is ~350-400Mi
-          #     for a single worker; 512Mi covers it with headroom.
-          #
-          # Limits    = hard ceiling the kubelet enforces (OOM-kill / throttle).
-          #
-          #   CPU 2000m — doubled from 1000m.  During inference the model
-          #     dispatches through libtorch which can utilise >1 core for
-          #     GEMM ops.  2 cores lets it burst without starving the node
-          #     (Minikube default is 4 cores).
-          #
-          #   Memory 2Gi — raised from 1.5Gi.  Under concurrent inference
-          #     each request allocates transient tensors (~20-40Mi per image
-          #     through the full ResNet pipeline).  2Gi prevents OOM kills
-          #     during traffic spikes while being conservative for local dev.
-          #
           resources:
             requests:
-              cpu: "500m"
+              cpu: "500m"    # 500m avoids CFS throttling during ~97s model load
               memory: "512Mi"
             limits:
-              cpu: "2000m"
-              memory: "2Gi"
+              cpu: "2000m"   # burst for GEMM ops during inference
+              memory: "2Gi"  # headroom for concurrent-request transient tensors
 
-          # ── Health & Self-Healing Probes ─────────────────────────────────────
-          #
-          # Three-probe strategy for robust lifecycle management:
-          #
-          # IMPORTANT: startupProbe gates readinessProbe and livenessProbe.
-          # Kubernetes will NOT run readiness/liveness checks until the startup
-          # probe succeeds at least once.  This eliminates the need for
-          # initialDelaySeconds on the other two probes.
-          #
-          #  1. startupProbe   — protective shield during model loading.
-          #                      The ResNet-50 tensor deserialization takes ~97s
-          #                      on shared local CPUs.  We budget:
-          #                        18 failures × 10s period = 180s (~3 min)
-          #                      This comfortably covers the observed 97s load
-          #                      time with ~83s of headroom for resource
-          #                      contention on busy Minikube nodes.
-          #
-          #  2. readinessProbe — blocks Service traffic until /health → 200.
-          #                      Runs immediately once startup passes.
-          #                      5s period ≈ pod is routable within seconds of
-          #                      readiness.
-          #
-          #  3. livenessProbe  — auto-restarts if the Python process freezes,
-          #                      deadlocks, or the model enters a corrupt state.
-          #                      3 failures × 15s = 45s to detect a hang.
-          #
+          # Three-probe strategy (startupProbe gates the other two):
           startupProbe:
             httpGet:
               path: /health
               port: http
             initialDelaySeconds: 5      # give Gunicorn 5s to bind the socket
-            periodSeconds: 10           # poll every 10s during model loading
-            timeoutSeconds: 5           # single /health call should be instant
-            successThreshold: 1         # one 200 OK = model is loaded
-            failureThreshold: 18        # 18 × 10s = 180s max startup budget
+            periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 18        # 18 x 10s = 180s max startup budget
 
           readinessProbe:
             httpGet:
               path: /health
               port: http
-            # No initialDelaySeconds — gated behind startupProbe
-            periodSeconds: 5            # check frequently — fast traffic gating
+            periodSeconds: 5            # fast traffic gating post-startup
             timeoutSeconds: 5
             successThreshold: 1
-            failureThreshold: 3         # 3 × 5s = 15s before removing from LB
+            failureThreshold: 3         # 3 x 5s = 15s before removing from LB
 
           livenessProbe:
             httpGet:
               path: /health
               port: http
-            # No initialDelaySeconds — gated behind startupProbe
             periodSeconds: 15           # auto-restart frozen Python within ~45s
             timeoutSeconds: 5
             successThreshold: 1
-            failureThreshold: 3         # 3 × 15s = 45s to confirm dead process
+            failureThreshold: 3         # 3 x 15s = 45s to confirm dead process
 
-          # ── Environment Variables ───────────────────────────────────────────
-          # envFrom injects ALL keys from the ConfigMap as env vars.
-          # Explicit env entries below take PRECEDENCE over ConfigMap values,
-          # so critical runtime paths (PORT, TORCH_HOME) can never be
-          # accidentally overridden by a ConfigMap change.
           envFrom:
             - configMapRef:
                 name: simple-model-api-config
@@ -194,12 +110,9 @@ spec:
           env:
             - name: PORT
               value: "8000"
-            # Points to the pre-downloaded weights baked into the image.
-            # Must match the TORCH_HOME set in the Dockerfile.
             - name: TORCH_HOME
               value: "/opt/torch_cache"
 
-      # ── Graceful Shutdown ─────────────────────────────────────────────────
-      # 30s matches Gunicorn's default graceful timeout, giving in-flight
-      # inference requests time to complete before SIGKILL.
+      # 30s matches Gunicorn default graceful timeout - allows in-flight
+      # inference requests to complete before SIGKILL.
       terminationGracePeriodSeconds: 30

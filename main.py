@@ -1,5 +1,5 @@
-"""
-main.py — FastAPI application for ResNet-50 image classification.
+﻿"""
+main.py - FastAPI application for ResNet-50 image classification.
 
 Implements:
   FR-1.1:  Model Selection and Loading (lifespan-managed ResNet-50)
@@ -31,15 +31,10 @@ from metrics import INFERENCE_LATENCY, REQUEST_COUNT
 
 logger = logging.getLogger(__name__)
 
-# ── Constants ────────────────────────────────────────────────────────────
 MAX_FILE_SIZE_BYTES: int = 10 * 1024 * 1024  # 10 MB (FR-2.4)
 APP_VERSION: str = "1.0.0"
 MODEL_ARCHITECTURE: str = "ResNet-50"
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  FR-3.1: Structured error response builder
-# ═══════════════════════════════════════════════════════════════════════════
 
 def _error_response(
     *,
@@ -62,7 +57,7 @@ def _error_response(
         }
 
     The correlation ID is also set as a response header so load-balancer
-    logs can join request ↔ response without parsing the body.
+    logs can join request <-> response without parsing the body.
     """
     return JSONResponse(
         status_code=status_code,
@@ -77,10 +72,6 @@ def _error_response(
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  ImageNet class labels — loaded lazily from torchvision's bundled meta
-# ═══════════════════════════════════════════════════════════════════════════
-
 _IMAGENET_LABELS: list[str] | None = None
 
 
@@ -94,32 +85,29 @@ def _get_imagenet_labels() -> list[str]:
     return _IMAGENET_LABELS
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  FR-1.1: Lifespan — load model once, cache in app.state
-# ═══════════════════════════════════════════════════════════════════════════
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the ResNet-50 model lifecycle.
 
     On startup:
-      • Downloads (or loads from cache) ResNet-50 with ImageNet V2 weights.
-      • Switches to eval mode (disables dropout / batch-norm running stats).
-      • Stores the model on ``app.state.model`` for endpoint access.
+      - Downloads (or loads from cache) ResNet-50 with ImageNet V2 weights.
+      - Switches to eval mode (disables dropout / batch-norm running stats).
+      - Stores the model on ``app.state.model`` for endpoint access.
+      - Pre-warms dispatch tables with a dummy forward pass.
 
     On shutdown:
-      • Deletes the model reference so garbage collection can reclaim RAM
+      - Deletes the model reference so garbage collection can reclaim RAM
         (important when running under Gunicorn --preload + fork).
     """
     from torchvision.models import resnet50, ResNet50_Weights
 
-    logger.info("Loading %s with IMAGENET1K_V2 weights …", MODEL_ARCHITECTURE)
+    logger.info("Loading %s with IMAGENET1K_V2 weights ...", MODEL_ARCHITECTURE)
     weights = ResNet50_Weights.IMAGENET1K_V2
     model = resnet50(weights=weights)
     model.eval()
 
     # Pre-warm: the first forward pass through PyTorch compiles internal
-    # dispatch tables.  Doing it here keeps the latency out of the first
+    # dispatch tables. Doing it here keeps the latency out of the first
     # real request.
     with torch.no_grad():
         _warmup = model(torch.randn(1, 3, 224, 224))
@@ -128,26 +116,20 @@ async def lifespan(app: FastAPI):
     app.state.model = model
     logger.info("%s loaded and cached in app.state.", MODEL_ARCHITECTURE)
 
-    # ── Eager-load the label list so /predict never blocks on import ──
     _get_imagenet_labels()
 
-    yield  # ← application serves requests here
+    yield
 
-    # ── Shutdown ─────────────────────────────────────────────────────
     logger.info("Releasing %s from memory.", MODEL_ARCHITECTURE)
     del app.state.model
     torch.cuda.empty_cache()  # no-op on CPU, safe to call unconditionally
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Middleware: X-Correlation-ID and X-Response-Time
-# ═══════════════════════════════════════════════════════════════════════════
-
 class PerformanceHeadersMiddleware(BaseHTTPMiddleware):
     """Attach tracing and timing headers to every response.
 
-    • X-Correlation-ID  — unique per request; enables distributed tracing.
-    • X-Response-Time   — wall-clock ms for the full request lifecycle.
+    - X-Correlation-ID: unique per request; enables distributed tracing.
+    - X-Response-Time: wall-clock ms for the full request lifecycle.
     """
 
     async def dispatch(self, request: Request, call_next):
@@ -161,11 +143,6 @@ class PerformanceHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Correlation-ID"] = correlation_id
         response.headers["X-Response-Time"] = f"{elapsed_ms:.2f}ms"
         return response
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Prometheus request-counting middleware
-# ═══════════════════════════════════════════════════════════════════════════
 
 
 class PrometheusMiddleware(BaseHTTPMiddleware):
@@ -187,10 +164,6 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
         return response
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Application instance
-# ═══════════════════════════════════════════════════════════════════════════
-
 app = FastAPI(
     title="Simple Model API",
     description="Production-grade ResNet-50 image classification service.",
@@ -201,30 +174,22 @@ app = FastAPI(
 app.add_middleware(PerformanceHeadersMiddleware)
 app.add_middleware(PrometheusMiddleware)
 
-# Expose /metrics for Prometheus scraping — unauthenticated by design;
-# access control is enforced at the network/namespace level in Kubernetes.
-# Uses a native route instead of app.mount(make_asgi_app()) because
-# BaseHTTPMiddleware strips path context from mounted ASGI sub-apps.
-
-
+# /metrics is unauthenticated by design; access control is enforced at the
+# network/namespace level in Kubernetes. Uses a native route instead of
+# app.mount(make_asgi_app()) because BaseHTTPMiddleware strips path context
+# from mounted ASGI sub-apps.
 @app.get("/metrics", tags=["operations"])
 async def metrics() -> Response:
-    """Prometheus scrape endpoint.  Returns all registered metrics."""
+    """Prometheus scrape endpoint. Returns all registered metrics."""
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  FR-2.2: GET /health — model-aware readiness probe
-# ═══════════════════════════════════════════════════════════════════════════
 
 @app.get("/health", tags=["operations"])
 async def health(request: Request) -> JSONResponse:
     """Return 200 if the model is loaded and ready, 503 otherwise.
 
-    The health endpoint is consumed by:
-      • The Dockerfile HEALTHCHECK directive
-      • docker-compose healthcheck
-      • Upstream load-balancer readiness probes
+    Consumed by: Dockerfile HEALTHCHECK, docker-compose healthcheck,
+    and Kubernetes readiness/liveness probes.
     """
     model = getattr(request.app.state, "model", None)
     correlation_id: str = getattr(request.state, "correlation_id", "")
@@ -248,10 +213,6 @@ async def health(request: Request) -> JSONResponse:
         headers={"X-Correlation-ID": correlation_id},
     )
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  GET /info — application metadata
-# ═══════════════════════════════════════════════════════════════════════════
 
 @app.get("/info", tags=["operations"])
 async def info(request: Request) -> JSONResponse:
@@ -290,11 +251,6 @@ async def info(request: Request) -> JSONResponse:
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Inference pipeline (extracted for clean Prometheus latency observation)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
 def _run_inference(
     model: torch.nn.Module,
     image_bytes: bytes,
@@ -302,13 +258,12 @@ def _run_inference(
     correlation_id: str,
     filename: str | None,
 ) -> JSONResponse:
-    """Execute preprocess → forward pass → postprocess, return JSONResponse.
+    """Execute preprocess -> forward pass -> postprocess, return JSONResponse.
 
     Extracted from the predict endpoint so the caller can wrap the single
     call-site in try/finally for guaranteed Prometheus histogram observation
-    on every exit path — success, preprocessing failure, or OOM.
+    on every exit path (success, preprocessing failure, or OOM).
     """
-    # ── FR-1.3: Preprocess (delegates to inference.py) ───────────────
     result = preprocess_image(image_bytes)
 
     if not result.ok:
@@ -319,13 +274,11 @@ def _run_inference(
             correlation_id=correlation_id,
         )
 
-    # ── Forward pass (FR-3.2: wrapped in RuntimeError guard) ─────────
     try:
         with torch.no_grad():
             logits: torch.Tensor = model(result.tensor)
     except RuntimeError as exc:
-        # FR-3.2: OOM or dimension mismatch during inference —
-        # return a clean error, never crash the worker.
+        # FR-3.2: OOM or dimension mismatch during inference.
         logger.critical("RuntimeError during model forward pass: %s", exc)
         if "out of memory" in str(exc).lower():
             torch.cuda.empty_cache()
@@ -340,7 +293,6 @@ def _run_inference(
             correlation_id=correlation_id,
         )
 
-    # ── Post-process: softmax → top-k ────────────────────────────────
     try:
         probabilities = torch.nn.functional.softmax(logits, dim=1)
         top_probs, top_indices = torch.topk(probabilities, k=top_k, dim=1)
@@ -381,10 +333,6 @@ def _run_inference(
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  FR-2.1: POST /predict — image classification
-# ═══════════════════════════════════════════════════════════════════════════
-
 @app.post("/predict", tags=["inference"])
 async def predict(
     request: Request,
@@ -393,18 +341,17 @@ async def predict(
         default=5,
         ge=1,
         le=10,
-        description="Number of top predictions to return (1–10).",
+        description="Number of top predictions to return (1-10).",
     ),
 ) -> JSONResponse:
     """Classify an uploaded image and return the top-k predictions.
 
     Pipeline:
-        multipart upload → validation → preprocess_image() → model forward
-        → softmax → top-k sort → structured JSON response.
+        multipart upload -> validation -> preprocess_image() -> model forward
+        -> softmax -> top-k sort -> structured JSON response.
     """
     correlation_id: str = getattr(request.state, "correlation_id", "")
 
-    # ── FR-2.2 guard: reject if model is not loaded ──────────────────
     model = getattr(request.app.state, "model", None)
     if model is None:
         return _error_response(
@@ -414,7 +361,6 @@ async def predict(
             correlation_id=correlation_id,
         )
 
-    # ── FR-2.4: Validate file is not empty ───────────────────────────
     image_bytes: bytes = await file.read()
 
     if not image_bytes:
@@ -425,7 +371,6 @@ async def predict(
             correlation_id=correlation_id,
         )
 
-    # ── FR-2.4: Enforce 10 MB maximum ────────────────────────────────
     if len(image_bytes) > MAX_FILE_SIZE_BYTES:
         size_mb = len(image_bytes) / (1024 * 1024)
         return _error_response(
@@ -438,9 +383,8 @@ async def predict(
             correlation_id=correlation_id,
         )
 
-    # ── Inference pipeline with Prometheus latency tracking ──────────
     # try/finally guarantees the histogram sample is recorded on every
-    # exit path — success, preprocessing rejection, or forward-pass OOM.
+    # exit path: success, preprocessing rejection, or forward-pass OOM.
     _t0 = time.perf_counter()
     try:
         return _run_inference(model, image_bytes, top_k, correlation_id, file.filename)
@@ -448,17 +392,13 @@ async def predict(
         INFERENCE_LATENCY.observe(time.perf_counter() - _t0)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  FR-3.1: Global exception handler — catch-all safety net
-# ═══════════════════════════════════════════════════════════════════════════
-
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Convert any uncaught exception into a structured JSON error.
 
-    This is the last line of defence.  If a bug slips past the
-    per-endpoint handlers, the client still receives a parseable
-    JSON body instead of a raw stack trace.
+    Last line of defence: if a bug slips past per-endpoint handlers,
+    the client still receives a parseable JSON body instead of a raw
+    stack trace.
     """
     correlation_id: str = getattr(request.state, "correlation_id", uuid.uuid4().hex)
     logger.exception(

@@ -15,10 +15,10 @@
 #
 # How the scaling math works (CPU)
 # ────────────────────────────────
-#   CPU request per pod     = 250m  (from deployment.yaml)
-#   Target average util     = 70%   → target usage = 175m per pod
+#   CPU request per pod     = 500m  (from deployment.yaml)
+#   Target average util     = 70%   → target usage = 350m per pod
 #
-#   Example:  3 pods at 225m each → avg util = 90%
+#   Example:  3 pods at 450m each → avg util = 90%
 #             Desired = ceil(3 × 90/70) = ceil(3.86) = 4
 #
 # How the scaling math works (Memory)
@@ -42,7 +42,7 @@
 # Quick-ref configurable values (search & replace):
 #   MIN_REPLICAS              →  2
 #   MAX_REPLICAS              →  10
-#   CPU_TARGET_UTILIZATION    →  70
+#   CPU_TARGET_UTILIZATION    →  70   (70% of 500m request = 350m target/pod)
 #   MEMORY_TARGET_UTILIZATION →  80
 ###############################################################################
 apiVersion: autoscaling/v2
@@ -103,14 +103,14 @@ spec:
   #             batches and protects the warm model cache in each pod.
   behavior:
     scaleUp:
-      stabilizationWindowSeconds: 0             # react immediately to load
+      stabilizationWindowSeconds: 0 # react immediately to load
       policies:
         - type: Pods
-          value: 3                              # add at most 3 pods per window
+          value: 3 # add at most 3 pods per window
           periodSeconds: 60
     scaleDown:
-      stabilizationWindowSeconds: 300           # 5-min cooldown before scaling in
+      stabilizationWindowSeconds: 300 # 5-min cooldown before scaling in
       policies:
         - type: Pods
-          value: 1                              # remove at most 1 pod per window
-          periodSeconds: 180                    # 3-min between successive removals
+          value: 1 # remove at most 1 pod per window
+          periodSeconds: 180 # 3-min between successive removals
