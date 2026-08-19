@@ -36,7 +36,7 @@
 #
 # Quick-ref configurable values (search & replace):
 #   CONTAINER_PORT  →  8000
-#   IMAGE_TAG       →  simple-model-api:latest
+#   IMAGE_TAG       →  ghcr.io/mohamed-shaaker/simple-model-api:latest
 #   REPLICAS        →  2
 ###############################################################################
 apiVersion: apps/v1
@@ -67,14 +67,25 @@ spec:
         prometheus.io/port: "8000"
         prometheus.io/path: "/metrics"
     spec:
+      # ── Pull credentials for ghcr.io ──────────────────────────────────────
+      # The ghcr-credentials secret is a docker-registry type secret.
+      # Create it once locally with the one-liner in the CI/CD guide.
+      # If you make the GHCR package Public this block can be removed.
+      imagePullSecrets:
+        - name: ghcr-credentials
       containers:
         - name: simple-model-api
-          image: simple-model-api:latest
+          # Image lives on GitHub Container Registry, pushed by CI/CD pipeline.
+          # CI pushes two tags per commit:
+          #   :latest           → always the most recent build of main
+          #   :sha-<short-sha>  → immutable per-commit tag for rollbacks
+          image: ghcr.io/mohamed-shaaker/simple-model-api:latest
 
-          # ── CRITICAL for Minikube local images ──────────────────────────────
-          # Never pull from a remote registry; use the image that was built
-          # directly inside Minikube's Docker daemon.
-          imagePullPolicy: IfNotPresent
+          # ── Always pull from ghcr.io on rollout ─────────────────────────────
+          # Changed from IfNotPresent (Minikube local images) to Always so that
+          # `kubectl rollout restart` fetches the newest :latest digest from GHCR
+          # without needing to change the tag in this manifest.
+          imagePullPolicy: Always
 
           ports:
             - name: http
