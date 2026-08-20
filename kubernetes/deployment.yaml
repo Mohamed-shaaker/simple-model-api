@@ -1,4 +1,4 @@
-﻿# simple-model-api - Kubernetes Deployment (FR-1 / FR-3)
+# simple-model-api - Kubernetes Deployment (FR-1 / FR-3)
 #
 # Key design decisions:
 #   replicas: 2         matches HPA minReplicas; fits alongside monitoring stack.
@@ -12,13 +12,13 @@
 #   envFrom ConfigMap   decouples LOG_LEVEL, ENVIRONMENT, etc. from this manifest.
 #
 # Health probe timing rationale:
-#   ResNet-50 lifespan performs: weight deserialization (~70-97s on local CPUs),
-#   model.eval(), a warm-up forward pass, and ImageNet label eager-load.
-#   Total cold-start budget: ~97s observed, up to ~120s under heavy contention.
-#
-#   startupProbe   18 x 10s = 180s budget (~3 min); gates ALL other probes.
-#   readinessProbe no initialDelay (gated by startup); 5s period for fast LB registration.
-#   livenessProbe  no initialDelay (gated by startup); 3 x 15s = 45s to detect a hang.
+#   startupProbe   (failureThreshold: 18 × periodSeconds: 10 = 180s budget):
+#                  Gates all other probes. Absorbs the full ResNet-50 cold-start
+#                  window (~97s observed) with ~83s of headroom.
+#   readinessProbe (initialDelaySeconds: 15): Gives PyTorch sufficient time to
+#                  load weights before receiving traffic; only runs after startup passes.
+#   livenessProbe  (initialDelaySeconds: 30): Extra buffer before liveness checks
+#                  begin; auto-restarts frozen workers after 3 × 15s = 45s.
 #
 # Quick-ref values:
 #   CONTAINER_PORT  8000
@@ -74,34 +74,37 @@ spec:
               cpu: "2000m"   # burst for GEMM ops during inference
               memory: "2Gi"  # headroom for concurrent-request transient tensors
 
-          # Three-probe strategy (startupProbe gates the other two):
+          # Three-probe strategy: startupProbe gates readiness and liveness.
+          # Kubernetes will not run readiness/liveness checks until startupProbe
+          # succeeds at least once, eliminating premature pod termination during
+          # the ~97s ResNet-50 weight deserialization window.
           startupProbe:
             httpGet:
               path: /health
-              port: http
+              port: 8000
             initialDelaySeconds: 5      # give Gunicorn 5s to bind the socket
             periodSeconds: 10
             timeoutSeconds: 5
             successThreshold: 1
-            failureThreshold: 18        # 18 x 10s = 180s max startup budget
+            failureThreshold: 18        # 18 × 10s = 180s startup budget
 
           readinessProbe:
             httpGet:
               path: /health
-              port: http
-            periodSeconds: 5            # fast traffic gating post-startup
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
             timeoutSeconds: 5
-            successThreshold: 1
-            failureThreshold: 3         # 3 x 5s = 15s before removing from LB
+            failureThreshold: 3
 
           livenessProbe:
             httpGet:
               path: /health
-              port: http
-            periodSeconds: 15           # auto-restart frozen Python within ~45s
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
             timeoutSeconds: 5
-            successThreshold: 1
-            failureThreshold: 3         # 3 x 15s = 45s to confirm dead process
+            failureThreshold: 3
 
           envFrom:
             - configMapRef:
