@@ -47,8 +47,12 @@ RUN /opt/venv/bin/pip install python-multipart
 FROM python:3.10-slim AS runtime
 
 # Deterministic, crash-friendly Python behaviour in containers.
+# PORT is read by the CMD entrypoint at runtime so the image works on
+# serverless platforms (Cloud Run, Railway, Render, …) that inject $PORT.
+# Falls back to 8000 for local docker run / docker-compose usage.
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PORT=8000
 
 # Copy the pre-built virtual-env from the builder stage.
 COPY --from=builder /opt/venv /opt/venv
@@ -83,15 +87,19 @@ COPY . .
 USER appuser
 
 # Health-check: hit the /health endpoint the app already exposes (FR-2.2).
+# Uses shell form so $PORT is expanded at runtime (not build time).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD ["python", "-c", \
-         "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+    CMD python -c \
+        "import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.environ.get('PORT','8000') + '/health')"
 
-EXPOSE 8000
+# Inform the Docker runtime which port the process listens on.
+# EXPOSE is documentation only; the actual bind address is set in CMD.
+EXPOSE ${PORT}
 
 # Default entrypoint — overridden by docker-compose command.
-CMD ["gunicorn", "main:app", \
-     "--workers", "1", \
-     "--worker-class", "uvicorn.workers.UvicornWorker", \
-     "--bind", "0.0.0.0:8000", \
-     "--timeout", "120"]
+# Shell form is required so the shell expands $PORT before passing to gunicorn.
+CMD gunicorn main:app \
+    --workers 1 \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --bind "0.0.0.0:${PORT}" \
+    --timeout 120

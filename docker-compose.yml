@@ -32,7 +32,7 @@ services:
     command: >
       gunicorn main:app
       -k uvicorn.workers.UvicornWorker
-      --bind 0.0.0.0:8000
+      --bind 0.0.0.0:${PORT:-8000}
       --workers 2
       --preload
       --timeout 120
@@ -40,7 +40,7 @@ services:
       --access-logfile -
 
     ports:
-      - "8000:8000"
+      - "${PORT:-8000}:${PORT:-8000}"
 
     # ── Cgroup resource protections ───────────────────────────────────
     #
@@ -95,7 +95,7 @@ services:
     #   download on very first build.
     healthcheck:
       test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+             "import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.environ.get('PORT','8000') + '/health')"]
       interval: 30s
       timeout: 5s
       start_period: 60s
